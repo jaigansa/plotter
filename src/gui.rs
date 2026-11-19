@@ -275,7 +275,7 @@ fn render_group_item(ui: &mut egui::Ui, group: &mut SvgGroupItem, depth: usize) 
 
     ui.horizontal(|ui| {
         ui.add_space(indent);
-        let arrow = if group.expanded { "▼" } else { "▶" };
+        let arrow = if group.expanded { icons::CARET_DOWN } else { icons::CARET_RIGHT };
         if ui.small_button(arrow).clicked() {
             group.expanded = !group.expanded;
         }
@@ -1042,7 +1042,7 @@ impl eframe::App for RedsailGuiApp {
                         .inner_margin(egui::Margin::symmetric(10, 4))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                ui.colored_label(dot_color, "●");
+                                ui.colored_label(dot_color, icons::PLUG);
                                 ui.label(egui::RichText::new(status_text).size(11.5).strong().color(Color32::WHITE));
                             });
                         });
@@ -1066,7 +1066,7 @@ impl eframe::App for RedsailGuiApp {
                         self.notify_port_config_changed();
                     }
 
-                    if ui.small_button("↻").on_hover_text("Refresh Serial Ports").clicked() {
+                    if ui.small_button(icons::ARROW_CLOCKWISE).on_hover_text("Refresh Serial Ports").clicked() {
                         self.refresh_ports();
                     }
 
@@ -1074,20 +1074,20 @@ impl eframe::App for RedsailGuiApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Emergency Stop Button
                         let halt_btn = egui::Button::new(
-                            egui::RichText::new("🛑 STOP")
+                            egui::RichText::new(format!("{} STOP", icons::STOP))
                                 .color(Color32::WHITE)
                                 .strong()
-                                .size(12.0),
+                                .size(13.0),
                         )
                         .fill(Color32::from_rgb(220, 38, 38));
-                        if ui.add_sized([90.0, 26.0], halt_btn).on_hover_text("Emergency halt: immediately stops machine and lifts blade").clicked() {
+                        if ui.add_sized([95.0, 26.0], halt_btn).on_hover_text("Emergency halt: immediately stops machine and lifts blade").clicked() {
                             self.cancel_cut();
                         }
 
                         ui.add_space(10.0);
-                        ui.toggle_value(&mut self.developer_mode, "Developer");
-                        ui.toggle_value(&mut self.show_console_log, "Console");
-                        ui.toggle_value(&mut self.show_machine_panel, "Machine Controls");
+                        ui.toggle_value(&mut self.developer_mode, format!("{} Dev", icons::GEAR));
+                        ui.toggle_value(&mut self.show_console_log, format!("{} Console", icons::TERMINAL_WINDOW));
+                        ui.toggle_value(&mut self.show_machine_panel, format!("{} Controls", icons::SLIDERS));
                     });
                 });
             });
@@ -1103,7 +1103,7 @@ impl eframe::App for RedsailGuiApp {
                             if ui.small_button("Clear").clicked() {
                                 self.status_log.clear();
                             }
-                            if ui.small_button("✕").on_hover_text("Close Console").clicked() {
+                            if ui.small_button(icons::X).on_hover_text("Close Console").clicked() {
                                 self.show_console_log = false;
                             }
                         });
@@ -1125,7 +1125,7 @@ impl eframe::App for RedsailGuiApp {
                     ui.label(egui::RichText::new(last_log).size(11.5).color(Color32::from_rgb(220, 225, 235)));
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(egui::RichText::new(format!("{} baud • {}", self.baud, self.flow_mode)).size(11.0).color(Color32::DARK_GRAY));
+                        ui.label(egui::RichText::new(format!("{} baud | {}", self.baud, self.flow_mode)).size(11.0).color(Color32::DARK_GRAY));
                         ui.separator();
                         let cut_dist = self.total_cut_length_mm();
                         ui.label(egui::RichText::new(format!("Total Cut Distance: {:.1} mm", cut_dist)).size(11.0).color(Color32::from_rgb(0, 180, 240)));
@@ -1143,12 +1143,12 @@ impl eframe::App for RedsailGuiApp {
                 // --- 1. Design Files & Hierarchy ---
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("📁 Design Artwork").strong().size(12.5));
+                        ui.label(egui::RichText::new(format!("{} Artwork & Layers", icons::FOLDER_OPEN)).strong().size(12.5));
                         let tot_files = self.loaded_docs.len();
                         let sel_p = self.selected_paths_count();
                         let tot_p = self.total_paths_count();
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(egui::RichText::new(format!("{} files • {}/{} paths", tot_files, sel_p, tot_p)).size(11.0).color(Color32::from_rgb(0, 210, 255)));
+                            ui.label(egui::RichText::new(format!("{} files | {}/{} paths", tot_files, sel_p, tot_p)).size(11.0).color(Color32::from_rgb(0, 210, 255)));
                         });
                     });
 
@@ -1156,7 +1156,7 @@ impl eframe::App for RedsailGuiApp {
 
                     ui.horizontal(|ui| {
                         if ui
-                            .button("📁 Browse / Add Files...")
+                            .button(format!("{} Browse / Add Files...", icons::FOLDER_OPEN))
                             .on_hover_text("Open native file dialog to select one or multiple SVG files")
                             .clicked()
                         {
@@ -1220,7 +1220,7 @@ impl eframe::App for RedsailGuiApp {
                                     let is_none = d_sel == 0;
 
                                     ui.horizontal(|ui| {
-                                        let arrow = if doc.expanded { "▼" } else { "▶" };
+                                        let arrow = if doc.expanded { icons::CARET_DOWN } else { icons::CARET_RIGHT };
                                         if ui.small_button(arrow).clicked() {
                                             doc.expanded = !doc.expanded;
                                         }
@@ -1244,8 +1244,8 @@ impl eframe::App for RedsailGuiApp {
 
                                         ui.label(
                                             egui::RichText::new(format!(
-                                                "📄 {} ({}/{})",
-                                                doc.filename, d_sel, d_total
+                                                "{} {} ({}/{})",
+                                                icons::FILE_SVG, doc.filename, d_sel, d_total
                                             ))
                                             .strong()
                                             .size(11.5)
@@ -1256,7 +1256,7 @@ impl eframe::App for RedsailGuiApp {
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
                                                 if ui
-                                                    .small_button("✕")
+                                                    .small_button(icons::TRASH)
                                                     .on_hover_text("Remove this file")
                                                     .clicked()
                                                 {
@@ -1290,7 +1290,7 @@ impl eframe::App for RedsailGuiApp {
                 // --- 2. Sizing & Dimensions ---
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("📐 Size & Dimensions").strong().size(12.0));
+                        ui.label(egui::RichText::new(format!("{} Size & Dimensions", icons::RULER)).strong().size(12.0));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("200%").clicked() && self.orig_width_mm > 0.0 {
                                 self.scale = 2.0;
@@ -1343,7 +1343,11 @@ impl eframe::App for RedsailGuiApp {
                     });
 
                     ui.horizontal(|ui| {
-                        let lock_icon = if self.lock_aspect_ratio { "🔗 Aspect Ratio: Locked" } else { "🔓 Aspect Ratio: Free" };
+                        let lock_icon = if self.lock_aspect_ratio {
+                            format!("{} Aspect Ratio: Locked", icons::LOCK)
+                        } else {
+                            format!("{} Aspect Ratio: Free", icons::LOCK_OPEN)
+                        };
                         ui.checkbox(&mut self.lock_aspect_ratio, lock_icon);
                     });
 
@@ -1375,7 +1379,7 @@ impl eframe::App for RedsailGuiApp {
 
                 // --- 3. Cutter Settings & Material ---
                 ui.group(|ui| {
-                    ui.label(egui::RichText::new("⚙ Material & Cut Settings").strong().size(12.0));
+                    ui.label(egui::RichText::new(format!("{} Material & Cut Settings", icons::SLIDERS)).strong().size(12.0));
 
                     egui::ComboBox::from_id_salt("material_preset_combo")
                         .selected_text(self.selected_preset.name())
@@ -1416,13 +1420,17 @@ impl eframe::App for RedsailGuiApp {
 
                 // --- 4. Cut Execution Action Bar ---
                 ui.group(|ui| {
-                    ui.label(egui::RichText::new("🚀 Job Execution").strong().size(12.0));
+                    ui.label(egui::RichText::new(format!("{} Job Execution", icons::PLAY)).strong().size(12.0));
 
                     let cut_btn = egui::Button::new(
-                        egui::RichText::new(if self.is_cutting { "CUTTING IN PROGRESS..." } else { "▶ CUT NOW" })
-                            .color(Color32::WHITE)
-                            .strong()
-                            .size(14.0),
+                        egui::RichText::new(if self.is_cutting {
+                            "CUTTING IN PROGRESS...".to_string()
+                        } else {
+                            format!("{} CUT NOW", icons::PLAY)
+                        })
+                        .color(Color32::WHITE)
+                        .strong()
+                        .size(14.0),
                     )
                     .fill(if self.is_cutting {
                         Color32::from_rgb(180, 120, 0)
@@ -1438,10 +1446,10 @@ impl eframe::App for RedsailGuiApp {
 
                     ui.horizontal(|ui| {
                         let btn_w = (ui.available_width() - 8.0) / 2.0;
-                        if ui.add_sized([btn_w, 28.0], egui::Button::new("👁 Dry Run")).on_hover_text("Simulate cut trajectory without sending to hardware").clicked() {
+                        if ui.add_sized([btn_w, 28.0], egui::Button::new(format!("{} Dry Run", icons::EYE))).on_hover_text("Simulate cut trajectory without sending to hardware").clicked() {
                             self.execute_cut(true);
                         }
-                        if ui.add_sized([btn_w, 28.0], egui::Button::new("✂ Test Cut")).on_hover_text("Cut small 12mm test square & triangle").clicked() {
+                        if ui.add_sized([btn_w, 28.0], egui::Button::new(format!("{} Test Cut", icons::SCISSORS))).on_hover_text("Cut small 12mm test square & triangle").clicked() {
                             self.execute_test_pattern();
                         }
                     });
@@ -1453,7 +1461,7 @@ impl eframe::App for RedsailGuiApp {
                         let progress = (sent as f32 / total as f32).clamp(0.0, 1.0);
                         ui.add(egui::ProgressBar::new(progress).text(format!("Sending: {:.0}% ({}/{} B)", progress * 100.0, sent, total)));
                         ui.add_space(4.0);
-                        let cancel_btn = egui::Button::new("🛑 Cancel Cut").fill(Color32::from_rgb(220, 38, 38));
+                        let cancel_btn = egui::Button::new(format!("{} Cancel Cut", icons::X)).fill(Color32::from_rgb(220, 38, 38));
                         if ui.add_sized([ui.available_width(), 28.0], cancel_btn).clicked() {
                             self.cancel_cut();
                         }
@@ -1476,7 +1484,7 @@ impl eframe::App for RedsailGuiApp {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("Serial Connection").strong().size(12.0));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("↻").on_hover_text("Refresh Ports").clicked() {
+                                if ui.small_button(icons::ARROW_CLOCKWISE).on_hover_text("Refresh Ports").clicked() {
                                     self.refresh_ports();
                                 }
                             });
@@ -1558,10 +1566,10 @@ impl eframe::App for RedsailGuiApp {
                         ui.add_space(4.0);
 
                         ui.vertical_centered_justified(|ui| {
-                            if ui.button("📍 Set Origin (Here)").on_hover_text("Zero coordinates at current blade position without moving motors").clicked() {
+                            if ui.button(format!("{} Set Origin (Here)", icons::CROSSHAIR)).on_hover_text("Zero coordinates at current blade position without moving motors").clicked() {
                                 self.set_origin_here();
                             }
-                            if ui.button("🏠 Return to Origin (0,0)").on_hover_text("Physically rapid travel tool carriage and feed back to 0,0").clicked() {
+                            if ui.button(format!("{} Return to Origin (0,0)", icons::HOUSE)).on_hover_text("Physically rapid travel tool carriage and feed back to 0,0").clicked() {
                                 self.go_home();
                             }
                         });
@@ -1587,29 +1595,29 @@ impl eframe::App for RedsailGuiApp {
                         ui.add_space(6.0);
 
                         ui.vertical_centered(|ui| {
-                            if ui.add_sized([120.0, 28.0], egui::Button::new("▲ Feed Out (+)")).on_hover_text("Feed vinyl forward").clicked() {
+                            if ui.add_sized([130.0, 28.0], egui::Button::new(format!("{} Feed Out (+)", icons::ARROW_UP))).on_hover_text("Feed vinyl forward").clicked() {
                                 self.jog_feed(self.jog_step_mm);
                             }
 
                             ui.add_space(2.0);
 
                             ui.horizontal(|ui| {
-                                let total_w = 75.0 + 65.0 + 75.0 + 8.0;
+                                let total_w = 78.0 + 72.0 + 78.0 + 8.0;
                                 ui.add_space(((ui.available_width() - total_w) / 2.0).max(0.0));
-                                if ui.add_sized([75.0, 28.0], egui::Button::new("◀ Left")).on_hover_text("Move carriage left").clicked() {
+                                if ui.add_sized([78.0, 28.0], egui::Button::new(format!("{} Left", icons::ARROW_LEFT))).on_hover_text("Move carriage left").clicked() {
                                     self.jog_carriage(self.jog_step_mm);
                                 }
-                                if ui.add_sized([65.0, 28.0], egui::Button::new("⌂ Home")).on_hover_text("Return to Origin 0,0").clicked() {
+                                if ui.add_sized([72.0, 28.0], egui::Button::new(format!("{} Home", icons::HOUSE))).on_hover_text("Return to Origin 0,0").clicked() {
                                     self.go_home();
                                 }
-                                if ui.add_sized([75.0, 28.0], egui::Button::new("Right ▶")).on_hover_text("Move carriage right").clicked() {
+                                if ui.add_sized([78.0, 28.0], egui::Button::new(format!("Right {}", icons::ARROW_RIGHT))).on_hover_text("Move carriage right").clicked() {
                                     self.jog_carriage(-self.jog_step_mm);
                                 }
                             });
 
                             ui.add_space(2.0);
 
-                            if ui.add_sized([120.0, 28.0], egui::Button::new("▼ Retract (-)")).on_hover_text("Retract vinyl backward").clicked() {
+                            if ui.add_sized([130.0, 28.0], egui::Button::new(format!("{} Retract (-)", icons::ARROW_DOWN))).on_hover_text("Retract vinyl backward").clicked() {
                                 self.jog_feed(-self.jog_step_mm);
                             }
                         });
@@ -1647,7 +1655,7 @@ impl eframe::App for RedsailGuiApp {
                             });
 
                             ui.add_space(4.0);
-                            if ui.add_sized([ui.available_width(), 26.0], egui::Button::new("📐 Axis Test Pattern")).on_hover_text("Cut 20x20mm test pattern with X/Y directional indicators").clicked() {
+                            if ui.add_sized([ui.available_width(), 26.0], egui::Button::new(format!("{} Axis Test Pattern", icons::COMPASS))).on_hover_text("Cut 20x20mm test pattern with X/Y directional indicators").clicked() {
                                 self.execute_axis_test_pattern();
                             }
                             if ui.add_sized([ui.available_width(), 26.0], egui::Button::new("Reset Machine (IN;SP1;)")).clicked() {
@@ -1698,18 +1706,18 @@ impl eframe::App for RedsailGuiApp {
 
                 // Canvas Zoom Controls on the Right
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("Fit View").on_hover_text("Reset Pan and Zoom to fit artwork").clicked() {
+                    if ui.small_button(format!("{} Fit View", icons::ARROWS_OUT)).on_hover_text("Reset Pan and Zoom to fit artwork").clicked() {
                         self.canvas_zoom = 1.0;
                         self.canvas_pan = Vec2::ZERO;
                     }
                     if ui.small_button("1:1").on_hover_text("Reset to 100% Zoom").clicked() {
                         self.canvas_zoom = 1.0;
                     }
-                    if ui.small_button(" - ").on_hover_text("Zoom Out").clicked() {
+                    if ui.small_button(icons::MAGNIFYING_GLASS_MINUS).on_hover_text("Zoom Out").clicked() {
                         self.canvas_zoom = (self.canvas_zoom * 0.85).max(0.2);
                     }
                     ui.label(egui::RichText::new(format!("{:.0}%", self.canvas_zoom * 100.0)).size(11.0).monospace().color(Color32::GRAY));
-                    if ui.small_button(" + ").on_hover_text("Zoom In").clicked() {
+                    if ui.small_button(icons::MAGNIFYING_GLASS_PLUS).on_hover_text("Zoom In").clicked() {
                         self.canvas_zoom = (self.canvas_zoom * 1.15).min(8.0);
                     }
                 });
@@ -1919,7 +1927,60 @@ impl eframe::App for RedsailGuiApp {
     }
 }
 
+#[allow(dead_code)]
+pub mod icons {
+    pub const ARROW_CLOCKWISE: &str = "\u{e036}";
+    pub const ARROW_DOWN: &str = "\u{e03e}";
+    pub const ARROW_LEFT: &str = "\u{e058}";
+    pub const ARROW_RIGHT: &str = "\u{e06c}";
+    pub const ARROW_UP: &str = "\u{e08e}";
+    pub const ARROWS_OUT: &str = "\u{e0a2}";
+    pub const CARET_DOWN: &str = "\u{e136}";
+    pub const CARET_RIGHT: &str = "\u{e13a}";
+    pub const COMPASS: &str = "\u{e1c8}";
+    pub const CROSSHAIR: &str = "\u{e1d6}";
+    pub const EYE: &str = "\u{e220}";
+    pub const FILE_SVG: &str = "\u{ed08}";
+    pub const FOLDER_OPEN: &str = "\u{e256}";
+    pub const GEAR: &str = "\u{e270}";
+    pub const HOUSE: &str = "\u{e2c2}";
+    pub const LOCK: &str = "\u{e2fa}";
+    pub const LOCK_OPEN: &str = "\u{e306}";
+    pub const MAGNIFYING_GLASS_MINUS: &str = "\u{e30e}";
+    pub const MAGNIFYING_GLASS_PLUS: &str = "\u{e310}";
+    pub const PLAY: &str = "\u{e3d0}";
+    pub const PLUG: &str = "\u{e946}";
+    pub const RULER: &str = "\u{e6b8}";
+    pub const SCISSORS: &str = "\u{eae0}";
+    pub const SLIDERS: &str = "\u{e432}";
+    pub const SQUARE: &str = "\u{e45e}";
+    pub const STOP: &str = "\u{e46c}";
+    pub const TARGET: &str = "\u{e47c}";
+    pub const TERMINAL_WINDOW: &str = "\u{eae8}";
+    pub const TRASH: &str = "\u{e4a6}";
+    pub const X: &str = "\u{e4f6}";
+}
+
 fn setup_custom_theme(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "Phosphor".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/Phosphor.ttf"
+        ))),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .push("Phosphor".to_owned());
+    fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .push("Phosphor".to_owned());
+    ctx.set_fonts(fonts);
+
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = Color32::from_rgb(18, 20, 26);
     visuals.window_fill = Color32::from_rgb(22, 24, 32);
