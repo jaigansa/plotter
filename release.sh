@@ -69,9 +69,9 @@ if [[ ! -f "${ARCHIVE_PATH}" || ! -f "${CHECKSUM_PATH}" ]]; then
 fi
 
 cat << EOF > "${NOTES_FILE}"
-# Redsail Cutter ${TAG}
+# Plotter ${TAG}
 
-Native Linux controller and HP-GL streamer for Redsail vinyl cutting plotters (RS360C, RS720C, RS800C, RS1120C, RS1360C, and compatible models).
+Native Linux controller and HP-GL streamer for vinyl cutting plotters (Redsail RS360C, RS720C, RS800C, RS1120C, RS1360C, and compatible HP-GL models).
 
 ### Features
 - **100% Pure Rust**: Standalone native Linux binary with no Wine, Python, or external runtime shims.
@@ -140,7 +140,7 @@ if command -v gh >/dev/null 2>&1; then
         gh release create "${TAG}" \
             "${ARCHIVE_PATH}" \
             "${CHECKSUM_PATH}" \
-            --title "Redsail Cutter ${TAG}" \
+            --title "Plotter ${TAG}" \
             --notes-file "${NOTES_FILE}" \
             "${GH_ARGS[@]}"
 
