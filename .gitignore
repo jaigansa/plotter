@@ -1,0 +1,7 @@
+/target
+/dist
+*.hpgl
+*.plt
+*.log
+EasyCutStudio6-64bit.exe
+extracted/

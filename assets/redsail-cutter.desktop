@@ -1,0 +1,22 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Plotter
+GenericName=Vinyl Cutting Plotter Controller
+Comment=Native Linux controller and HP-GL streamer for cutting plotters
+Exec=redsail-cutter gui %F
+Icon=redsail-cutter
+Terminal=false
+Categories=Graphics;VectorGraphics;HardwareSettings;Engineering;
+MimeType=image/svg+xml;
+Keywords=vinyl;cutter;plotter;redsail;hpgl;cnc;sign;cutting;
+StartupWMClass=redsail-cutter
+Actions=MachinePanel;DryRun;
+
+[Desktop Action MachinePanel]
+Name=Open Machine Controls
+Exec=redsail-cutter gui
+
+[Desktop Action DryRun]
+Name=Launch in Dry-Run Mode
+Exec=redsail-cutter gui

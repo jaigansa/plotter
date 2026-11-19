@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1e222a"/>
+      <stop offset="100%" stop-color="#14161b"/>
+    </linearGradient>
+    <linearGradient id="blade" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00d2ff"/>
+      <stop offset="100%" stop-color="#0077ff"/>
+    </linearGradient>
+    <linearGradient id="roller" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#8a99a8"/>
+      <stop offset="100%" stop-color="#4a5560"/>
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+  </defs>
+
+  <!-- Base Badge Background -->
+  <rect x="16" y="16" width="224" height="224" rx="48" fill="url(#bg)" stroke="#2f3542" stroke-width="4"/>
+
+  <!-- Plotter Guide Rail / Beam -->
+  <rect x="40" y="86" width="176" height="14" rx="4" fill="#2d3436" stroke="#4a5560" stroke-width="2"/>
+  <rect x="44" y="90" width="168" height="6" rx="2" fill="#1e222a"/>
+
+  <!-- Vinyl Media Sheet -->
+  <path d="M 52 70 L 204 70 C 208 70 210 74 210 78 L 210 196 C 210 200 206 204 202 204 L 54 204 C 50 204 46 200 46 196 L 46 78 C 46 74 48 70 52 70 Z" fill="#222730" stroke="#3b4252" stroke-width="2.5"/>
+
+  <!-- Grid / Ruler marks on vinyl -->
+  <line x1="52" y1="120" x2="204" y2="120" stroke="#2e3440" stroke-width="1.5" stroke-dasharray="4,4"/>
+  <line x1="52" y1="150" x2="204" y2="150" stroke="#2e3440" stroke-width="1.5" stroke-dasharray="4,4"/>
+  <line x1="52" y1="180" x2="204" y2="180" stroke="#2e3440" stroke-width="1.5" stroke-dasharray="4,4"/>
+  <line x1="90" y1="100" x2="90" y2="200" stroke="#2e3440" stroke-width="1.5" stroke-dasharray="4,4"/>
+  <line x1="130" y1="100" x2="130" y2="200" stroke="#2e3440" stroke-width="1.5" stroke-dasharray="4,4"/>
+  <line x1="170" y1="100" x2="170" y2="200" stroke="#2e3440" stroke-width="1.5" stroke-dasharray="4,4"/>
+
+  <!-- Cut Vector Path glowing -->
+  <path d="M 70 174 C 90 130 110 180 142 138 C 158 116 166 122 170 128" fill="none" stroke="url(#blade)" stroke-width="4" stroke-linecap="round" filter="url(#glow)"/>
+
+  <!-- Pinch Rollers -->
+  <rect x="56" y="74" width="22" height="36" rx="4" fill="url(#roller)" stroke="#222" stroke-width="1.5"/>
+  <rect x="178" y="74" width="22" height="36" rx="4" fill="url(#roller)" stroke="#222" stroke-width="1.5"/>
+
+  <!-- Tool Carriage Body -->
+  <rect x="110" y="70" width="38" height="42" rx="6" fill="#3b4252" stroke="#5e81ac" stroke-width="2"/>
+  <!-- Status LED on carriage -->
+  <circle cx="120" cy="80" r="3" fill="#a3be8c"/>
+  <!-- Carriage Tool Holder -->
+  <rect x="122" y="104" width="14" height="20" rx="3" fill="#d8dee9" stroke="#4c566a" stroke-width="1.5"/>
+  <!-- Carbide Blade Tip -->
+  <polygon points="125,124 133,124 129,134" fill="#88c0d0"/>
+  <!-- Spark cut contact point -->
+  <circle cx="129" cy="134" r="3" fill="#88c0d0" filter="url(#glow)"/>
+
+  <!-- Brand Accent: Red Sail swoosh -->
+  <path d="M 188 38 C 210 50 220 80 220 80 C 220 80 204 74 186 64 Z" fill="#e74c3c"/>
+</svg>

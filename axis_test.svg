@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="75mm" height="50mm" viewBox="0 0 75 50">
+  <!-- Origin crosshair at (5, 5) -->
+  <line x1="2" y1="5" x2="8" y2="5" stroke="black" stroke-width="0.5"/>
+  <line x1="5" y1="2" x2="5" y2="8" stroke="black" stroke-width="0.5"/>
+
+  <!-- X Axis (Longer: 50mm, from 5 to 55) -->
+  <line x1="5" y1="5" x2="55" y2="5" stroke="black" stroke-width="0.5"/>
+  <!-- X Arrowhead -->
+  <polyline points="50,8 55,5 50,2" fill="none" stroke="black" stroke-width="0.5"/>
+  <!-- Letter X -->
+  <line x1="57" y1="2" x2="63" y2="8" stroke="black" stroke-width="0.5"/>
+  <line x1="57" y1="8" x2="63" y2="2" stroke="black" stroke-width="0.5"/>
+
+  <!-- Y Axis (Shorter: 30mm, from 5 to 35) -->
+  <line x1="5" y1="5" x2="5" y2="35" stroke="black" stroke-width="0.5"/>
+  <!-- Y Arrowhead -->
+  <polyline points="2,30 5,35 8,30" fill="none" stroke="black" stroke-width="0.5"/>
+  <!-- Letter Y -->
+  <polyline points="2,42 5,38 8,42" fill="none" stroke="black" stroke-width="0.5"/>
+  <line x1="5" y1="38" x2="5" y2="34" stroke="black" stroke-width="0.5"/>
+
+  <!-- Asymmetric orientation test glyph: Letter F -->
+  <line x1="20" y1="12" x2="20" y2="26" stroke="black" stroke-width="0.5"/>
+  <line x1="20" y1="26" x2="29" y2="26" stroke="black" stroke-width="0.5"/>
+  <line x1="20" y1="19" x2="26" y2="19" stroke="black" stroke-width="0.5"/>
+
+  <!-- 10mm calibration reference square -->
+  <rect x="35" y="12" width="10" height="10" fill="none" stroke="black" stroke-width="0.5"/>
+</svg>
