@@ -67,8 +67,12 @@ impl HpglBuilder {
         self.current_pen_down = false;
     }
 
-    /// Pen Down cut (cutting line to destination)
+    /// Pen Down cut (cutting line to destination).
+    /// Automatically suppresses duplicate consecutive points to prevent stepper hesitation.
     pub fn pen_down(&mut self, x: i32, y: i32) {
+        if self.current_pen_down && self.last_x == Some(x) && self.last_y == Some(y) {
+            return;
+        }
         self.buffer.push_str(&format!("PD{},{};", x, y));
         self.current_pen_down = true;
         self.last_x = Some(x);
@@ -135,5 +139,20 @@ mod tests {
         assert!(hpgl.contains("PD50,50;PU;"));
         assert!(hpgl.ends_with("PU0,0;SP0;"));
         assert!(!hpgl.contains("!PG;"));
+    }
+
+    #[test]
+    fn test_duplicate_point_elimination() {
+        let settings = CutterSettings::default();
+        let mut builder = HpglBuilder::new(&settings);
+
+        builder.pen_up(10, 10);
+        builder.pen_down(20, 20);
+        builder.pen_down(20, 20); // duplicate point
+        builder.pen_down(30, 30);
+
+        let hpgl = builder.finish();
+        assert_eq!(hpgl.matches("PD20,20;").count(), 1);
+        assert!(hpgl.contains("PD20,20;PD30,30;"));
     }
 }

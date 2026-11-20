@@ -437,7 +437,46 @@ fn extract_bezpath_subpaths(bez: &BezPath, tolerance: f64) -> Vec<Vec<Point>> {
         out.push(current_subpath);
     }
 
-    out
+    // Merge collinear consecutive points to reduce command count and cutter vibration.
+    // Points that lie on the same straight line as their neighbors are removed,
+    // keeping only the endpoints of each straight run.
+    let merged: Vec<Vec<Point>> = out
+        .into_iter()
+        .map(|subpath| merge_collinear(&subpath))
+        .collect();
+
+    merged
+}
+
+/// Remove intermediate points that lie on a straight line between their neighbors.
+/// `eps` is the max perpendicular distance (mm) for a point to be considered collinear.
+fn merge_collinear(points: &[Point]) -> Vec<Point> {
+    if points.len() <= 2 {
+        return points.to_vec();
+    }
+
+    const EPS: f64 = 0.02; // 0.02 mm collinearity threshold
+
+    let mut result: Vec<Point> = Vec::new();
+    result.push(points[0]);
+
+    let mut i = 1;
+    while i < points.len() - 1 {
+        let p0 = result.last().unwrap();
+        let p1 = points[i];
+        let p2 = points[i + 1];
+
+        // Cross product magnitude = 2 * area of triangle (p0, p1, p2)
+        // If near zero, p1 is collinear between p0 and p2 -> skip p1
+        let cross = (p1.x - p0.x) * (p2.y - p0.y) - (p1.y - p0.y) * (p2.x - p0.x);
+        if cross.abs() > EPS {
+            result.push(p1);
+        }
+        i += 1;
+    }
+
+    result.push(points[points.len() - 1]);
+    result
 }
 
 fn parse_length(s: &str) -> Option<f64> {
@@ -498,5 +537,46 @@ mod tests {
         let mut active_after_invert = Vec::new();
         doc.collect_selected_paths(&mut active_after_invert);
         assert_eq!(active_after_invert.len(), 2);
+    }
+
+    #[test]
+    fn test_merge_collinear_removes_intermediate_points() {
+        // Three points on a straight line: middle should be removed
+        let pts = vec![
+            kurbo::Point::new(0.0, 0.0),
+            kurbo::Point::new(1.0, 1.0),
+            kurbo::Point::new(2.0, 2.0),
+        ];
+        let merged = merge_collinear(&pts);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0], kurbo::Point::new(0.0, 0.0));
+        assert_eq!(merged[1], kurbo::Point::new(2.0, 2.0));
+
+        // Points on an L-shape: corner should be kept
+        let pts = vec![
+            kurbo::Point::new(0.0, 0.0),
+            kurbo::Point::new(2.0, 0.0),
+            kurbo::Point::new(2.0, 3.0),
+        ];
+        let merged = merge_collinear(&pts);
+        assert_eq!(merged.len(), 3);
+
+        // Two points: unchanged
+        let pts = vec![
+            kurbo::Point::new(0.0, 0.0),
+            kurbo::Point::new(5.0, 5.0),
+        ];
+        let merged = merge_collinear(&pts);
+        assert_eq!(merged.len(), 2);
+
+        // Single point: unchanged
+        let pts = vec![kurbo::Point::new(1.0, 1.0)];
+        let merged = merge_collinear(&pts);
+        assert_eq!(merged.len(), 1);
+
+        // Empty: unchanged
+        let pts: Vec<kurbo::Point> = vec![];
+        let merged = merge_collinear(&pts);
+        assert_eq!(merged.len(), 0);
     }
 }

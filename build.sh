@@ -10,9 +10,19 @@ cd "${PROJECT_ROOT}"
 
 export CARGO_HOME="${CARGO_HOME:-/tmp/cargo}"
 
+run_cargo() {
+    cargo "$@" 2>&1 | awk '
+        /warning: failed to save last-use data/ { skip=6; next }
+        skip > 0 { skip--; next }
+        { print }
+    '
+    return "${PIPESTATUS[0]}"
+}
+
 MODE="release"
 DO_CLEAN=0
 DO_CHECK_ONLY=0
+DO_TEST=0
 
 print_usage() {
     cat <<EOF
@@ -22,6 +32,7 @@ Options:
     --release      Build optimized release binary (default)
     --debug        Build unoptimized debug binary
     --check        Run cargo check and linting only (no binary output)
+    --test         Run unit tests
     --clean        Clean build directory before compiling
     -h, --help     Show this help message
 EOF
@@ -39,6 +50,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --check)
             DO_CHECK_ONLY=1
+            shift
+            ;;
+        --test)
+            DO_TEST=1
             shift
             ;;
         --clean)
@@ -63,13 +78,20 @@ echo "    Cargo Home:   ${CARGO_HOME}"
 
 if [[ ${DO_CLEAN} -eq 1 ]]; then
     echo "==> Cleaning build artifacts..."
-    cargo clean
+    run_cargo clean
 fi
 
 if [[ ${DO_CHECK_ONLY} -eq 1 ]]; then
     echo "==> Running cargo check..."
-    cargo check
+    run_cargo check
     echo "==> Check passed successfully!"
+    exit 0
+fi
+
+if [[ ${DO_TEST} -eq 1 ]]; then
+    echo "==> Running cargo test..."
+    run_cargo test
+    echo "==> Tests passed successfully!"
     exit 0
 fi
 
@@ -77,7 +99,7 @@ START_TIME=$(date +%s)
 
 if [[ "${MODE}" == "release" ]]; then
     echo "==> Compiling in RELEASE mode (--release)..."
-    cargo build --release
+    run_cargo build --release
     TARGET_BIN="${PROJECT_ROOT}/target/release/redsail-cutter"
     
     if command -v strip >/dev/null 2>&1; then
@@ -86,7 +108,7 @@ if [[ "${MODE}" == "release" ]]; then
     fi
 else
     echo "==> Compiling in DEBUG mode..."
-    cargo build
+    run_cargo build
     TARGET_BIN="${PROJECT_ROOT}/target/debug/redsail-cutter"
 fi
 

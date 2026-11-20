@@ -7,21 +7,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::blade_offset::BladeCompensator;
+use crate::cut_validation;
 use crate::device::{list_ports, DetectedPort, FlowControlMode, RedsailDevice};
 use crate::hpgl::{mm_to_plotter, CutterSettings, HpglBuilder};
 use crate::svg_parser::{parse_svg, SvgDocument, SvgGroupItem, SvgPathItem};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanvasOriginCorner {
-    BottomRight, // Machine / Plotter Physical Alignment (Default)
-    TopLeft,     // Standard Screen / Graphics Alignment
+    BottomLeft,  // CAD Standard: 0,0 at bottom-left (+Width Right, +Length Up) (Default)
+    BottomRight, // Machine Standard: 0,0 at bottom-right (+Width Left, +Length Up)
+    TopLeft,     // Screen Standard: 0,0 at top-left (+Width Right, +Length Down)
 }
 
 impl CanvasOriginCorner {
     pub fn name(&self) -> &'static str {
         match self {
-            CanvasOriginCorner::BottomRight => "Origin: Bottom-Right",
-            CanvasOriginCorner::TopLeft => "Origin: Top-Left",
+            CanvasOriginCorner::BottomLeft => "Origin: Bottom-Left (CAD Standard)",
+            CanvasOriginCorner::BottomRight => "Origin: Bottom-Right (Machine Standard)",
+            CanvasOriginCorner::TopLeft => "Origin: Top-Left (Screen Standard)",
         }
     }
 }
@@ -293,10 +296,12 @@ fn spawn_serial_worker(
     });
 }
 
-fn render_path_item(ui: &mut egui::Ui, path: &mut SvgPathItem, depth: usize) {
+fn render_path_item(ui: &mut egui::Ui, path: &mut SvgPathItem, depth: usize, dirty: &mut bool) {
     ui.horizontal(|ui| {
         ui.add_space((depth as f32) * 14.0);
-        ui.checkbox(&mut path.selected, "");
+        if dot_checkbox(ui, &mut path.selected, "").clicked() {
+            *dirty = true;
+        }
         let badge = if path.is_closed { "[Closed]" } else { "[Open]" };
         let path_label = if !path.name.is_empty() {
             format!("{} {}", path.name, badge)
@@ -314,7 +319,7 @@ fn render_path_item(ui: &mut egui::Ui, path: &mut SvgPathItem, depth: usize) {
     });
 }
 
-fn render_group_item(ui: &mut egui::Ui, group: &mut SvgGroupItem, depth: usize) {
+fn render_group_item(ui: &mut egui::Ui, group: &mut SvgGroupItem, depth: usize, dirty: &mut bool) {
     let indent = (depth as f32) * 14.0;
     let total = group.total_paths();
     if total == 0 {
@@ -332,7 +337,8 @@ fn render_group_item(ui: &mut egui::Ui, group: &mut SvgGroupItem, depth: usize) 
         }
 
         let mut checked = is_all;
-        if ui.checkbox(&mut checked, "").clicked() {
+        if dot_checkbox(ui, &mut checked, "").clicked() {
+            *dirty = true;
             if is_all {
                 group.set_selected_recursive(false);
             } else {
@@ -372,10 +378,10 @@ fn render_group_item(ui: &mut egui::Ui, group: &mut SvgGroupItem, depth: usize) 
 
     if group.expanded {
         for sub_grp in &mut group.groups {
-            render_group_item(ui, sub_grp, depth + 1);
+            render_group_item(ui, sub_grp, depth + 1, dirty);
         }
         for path in &mut group.paths {
-            render_path_item(ui, path, depth + 1);
+            render_path_item(ui, path, depth + 1, dirty);
         }
     }
 }
@@ -389,6 +395,9 @@ pub struct RedsailGuiApp {
     speed: u32,
     force: u32,
     blade_offset: f64,
+    flatten_tolerance: f64,
+    max_cut_width: f64,
+    min_feature: f64,
     scale: f64,
     custom_width_mm: f64,
     custom_height_mm: f64,
@@ -396,8 +405,17 @@ pub struct RedsailGuiApp {
     orig_height_mm: f64,
     lock_aspect_ratio: bool,
     normalize_origin: bool,
-    flip_y: bool,
-    swap_xy: bool,
+
+    // Canvas (display) axis controls — affects what you see on screen
+    canvas_flip_x: bool,
+    canvas_flip_y: bool,
+    canvas_swap_xy: bool,
+
+    // Machine (cutting) axis controls — affects what the plotter cuts
+    machine_flip_x: bool,
+    machine_flip_y: bool,
+    machine_swap_xy: bool,
+
     add_weeding_box: bool,
     weeding_margin: f64,
     ports: Vec<DetectedPort>,
@@ -428,6 +446,12 @@ pub struct RedsailGuiApp {
     pub pos_active_only: bool,
     pub target_move_x: f64,
     pub target_move_y: f64,
+
+    // Transform cache: separate canvas (display) and machine (cutting) caches
+    // since they use different axis controls.
+    canvas_cache: Option<TransformedOutput>,
+    machine_cache: Option<TransformedOutput>,
+    transform_dirty: bool,
 }
 
 fn find_preferred_port(ports: &[DetectedPort]) -> String {
@@ -437,6 +461,47 @@ fn find_preferred_port(ports: &[DetectedPort]) -> String {
         .or_else(|| ports.first())
         .map(|p| p.name.clone())
         .unwrap_or_default()
+}
+
+/// Checkbox that paints a filled dot when checked instead of a checkmark.
+fn dot_checkbox(ui: &mut egui::Ui, checked: &mut bool, label: &str) -> egui::Response {
+    let icon_size = ui.spacing().interact_size.y;
+    let font_id = ui.style().text_styles[&egui::TextStyle::Body].clone();
+    let label_size = font_id.size * label.len() as f32 * 0.6;
+    let total_width = icon_size + ui.spacing().item_spacing.x + label_size;
+
+    let (rect, mut response) = ui.allocate_exact_size(
+        egui::vec2(total_width, icon_size),
+        egui::Sense::click(),
+    );
+
+    if response.clicked() {
+        *checked = !*checked;
+        response.mark_changed();
+    }
+
+    let box_rect = egui::Rect::from_min_size(rect.min, egui::vec2(icon_size, icon_size));
+    let visuals = ui.style().interact_selectable(&response, *checked);
+    let text_color = visuals.fg_stroke.color;
+    ui.painter()
+        .rect_stroke(box_rect, egui::CornerRadius::same(2), visuals.fg_stroke, egui::StrokeKind::Inside);
+
+    if *checked {
+        let center = box_rect.center();
+        ui.painter()
+            .circle_filled(center, icon_size * 0.22, text_color);
+    }
+
+    if !label.is_empty() {
+        let galley = ui.fonts(|f| f.layout(label.to_string(), font_id, text_color, f32::INFINITY));
+        let text_pos = egui::pos2(
+            box_rect.right() + ui.spacing().item_spacing.x,
+            rect.center().y - galley.size().y / 2.0,
+        );
+        ui.painter().galley(text_pos, galley, text_color);
+    }
+
+    response
 }
 
 impl Default for RedsailGuiApp {
@@ -470,6 +535,9 @@ impl Default for RedsailGuiApp {
             speed: 20,
             force: 40,
             blade_offset: 0.0,
+            flatten_tolerance: 0.1,
+            max_cut_width: 600.0,
+            min_feature: 0.5,
             scale: 1.0,
             custom_width_mm: 30.0,
             custom_height_mm: 30.0,
@@ -477,8 +545,17 @@ impl Default for RedsailGuiApp {
             orig_height_mm: 30.0,
             lock_aspect_ratio: true,
             normalize_origin: true,
-            flip_y: true,
-            swap_xy: true,
+
+            // Canvas defaults: match SVG as-is
+            canvas_flip_x: false,
+            canvas_flip_y: false,
+            canvas_swap_xy: false,
+
+            // Machine defaults: plotter X/Y swapped (feed=X, carriage=Y), flip Y for standard Redsail
+            machine_flip_x: false,
+            machine_flip_y: true,
+            machine_swap_xy: true,
+
             add_weeding_box: false,
             weeding_margin: 5.0,
             ports,
@@ -509,6 +586,9 @@ impl Default for RedsailGuiApp {
             pos_active_only: true,
             target_move_x: 0.0,
             target_move_y: 0.0,
+            canvas_cache: None,
+            machine_cache: None,
+            transform_dirty: true,
         };
 
         app.load_svg();
@@ -517,8 +597,7 @@ impl Default for RedsailGuiApp {
 }
 
 impl RedsailGuiApp {
-    fn total_cut_length_mm(&self) -> f64 {
-        let output = self.transform_paths();
+    fn total_cut_length_mm(output: &TransformedOutput) -> f64 {
         let mut total_len = 0.0;
         for path in &output.active_paths {
             for window in path.windows(2) {
@@ -535,6 +614,222 @@ impl RedsailGuiApp {
             }
         }
         total_len
+    }
+
+    /// Compute the full transform with the given axis controls, and store it in the cache.
+    /// flip_x/flip_y/swap_xy are applied AFTER normalize/scale/offset, in final output space.
+    fn compute_transform(&mut self, flip_x: bool, flip_y: bool, swap_xy: bool) -> TransformedOutput {
+        let mut all_paths: Vec<(Vec<kurbo::Point>, bool)> = Vec::new();
+        for doc in &self.loaded_docs {
+            doc.collect_all_paths(&mut all_paths);
+        }
+
+        if all_paths.is_empty() {
+            return TransformedOutput::default();
+        }
+
+        // ---- Phase 1: raw document bounds ----
+        let mut doc_min_x = f64::MAX;
+        let mut doc_min_y = f64::MAX;
+        let mut doc_max_x = f64::MIN;
+        let mut doc_max_y = f64::MIN;
+
+        let mut act_raw_min_x = f64::MAX;
+        let mut act_raw_min_y = f64::MAX;
+        let mut has_active = false;
+
+        for (path, is_active) in &all_paths {
+            for pt in path {
+                if pt.x < doc_min_x { doc_min_x = pt.x; }
+                if pt.x > doc_max_x { doc_max_x = pt.x; }
+                if pt.y < doc_min_y { doc_min_y = pt.y; }
+                if pt.y > doc_max_y { doc_max_y = pt.y; }
+
+                if *is_active {
+                    has_active = true;
+                    if pt.x < act_raw_min_x { act_raw_min_x = pt.x; }
+                    if pt.y < act_raw_min_y { act_raw_min_y = pt.y; }
+                }
+            }
+        }
+
+        if doc_min_x > doc_max_x || doc_min_y > doc_max_y {
+            doc_min_x = 0.0; doc_max_x = 0.0;
+            doc_min_y = 0.0; doc_max_y = 0.0;
+        }
+        if !has_active {
+            act_raw_min_x = 0.0;
+            act_raw_min_y = 0.0;
+        }
+
+        let (eff_scale_x, eff_scale_y) = if self.orig_width_mm > 0.0 && self.orig_height_mm > 0.0 {
+            (
+                self.custom_width_mm / self.orig_width_mm,
+                self.custom_height_mm / self.orig_height_mm,
+            )
+        } else {
+            (self.scale, self.scale)
+        };
+
+        let margin_mm = (self.blade_offset * 2.0).max(2.0);
+        let extra_offset = if self.add_weeding_box { self.weeding_margin } else { 0.0 };
+        let base_offset = margin_mm + extra_offset;
+
+        // ---- Phase 2: compute base points (no flip/swap yet) ----
+        let mut base_active_paths: Vec<Vec<kurbo::Point>> = Vec::new();
+        let mut base_inactive_paths: Vec<Vec<kurbo::Point>> = Vec::new();
+
+        let mut base_act_min_x = f64::MAX;
+        let mut base_act_min_y = f64::MAX;
+        let mut base_act_max_x = f64::MIN;
+        let mut base_act_max_y = f64::MIN;
+
+        for (path, is_active) in all_paths {
+            let pts: Vec<kurbo::Point> = path
+                .iter()
+                .map(|pt| {
+                    let (norm_x, norm_y, offset_x, offset_y) = if self.pos_active_only && has_active {
+                        if is_active {
+                            let nx = if self.normalize_origin {
+                                pt.x - act_raw_min_x
+                            } else {
+                                pt.x
+                            };
+                            let ny = if self.normalize_origin {
+                                pt.y - act_raw_min_y
+                            } else {
+                                pt.y
+                            };
+                            (nx, ny, self.pos_x_mm, self.pos_y_mm)
+                        } else {
+                            let nx = if self.normalize_origin {
+                                pt.x - doc_min_x
+                            } else {
+                                pt.x
+                            };
+                            let ny = if self.normalize_origin {
+                                pt.y - doc_min_y
+                            } else {
+                                pt.y
+                            };
+                            (nx, ny, 0.0, 0.0)
+                        }
+                    } else {
+                        let nx = if self.normalize_origin {
+                            pt.x - doc_min_x
+                        } else {
+                            pt.x
+                        };
+                        let ny = if self.normalize_origin {
+                            pt.y - doc_min_y
+                        } else {
+                            pt.y
+                        };
+                        (nx, ny, self.pos_x_mm, self.pos_y_mm)
+                    };
+
+                    let x = norm_x * eff_scale_x + base_offset + offset_x;
+                    let y = norm_y * eff_scale_y + base_offset + offset_y;
+                    kurbo::Point::new(x, y)
+                })
+                .collect();
+
+            if is_active {
+                for pt in &pts {
+                    if pt.x < base_act_min_x { base_act_min_x = pt.x; }
+                    if pt.x > base_act_max_x { base_act_max_x = pt.x; }
+                    if pt.y < base_act_min_y { base_act_min_y = pt.y; }
+                    if pt.y > base_act_max_y { base_act_max_y = pt.y; }
+                }
+                base_active_paths.push(pts);
+            } else {
+                base_inactive_paths.push(pts);
+            }
+        }
+
+        // ---- Phase 3: apply flip/swap to get final points ----
+        let apply_axis = |pt: &kurbo::Point, max_x: f64, max_y: f64| -> kurbo::Point {
+            let mut x = pt.x;
+            let mut y = pt.y;
+            if flip_x { x = max_x - x; }
+            if flip_y { y = max_y - y; }
+            if swap_xy { std::mem::swap(&mut x, &mut y); }
+            kurbo::Point::new(x, y)
+        };
+
+        let mut active_paths: Vec<Vec<kurbo::Point>> = Vec::new();
+        let mut inactive_paths: Vec<Vec<kurbo::Point>> = Vec::new();
+
+        let mut act_min_x = f64::MAX;
+        let mut act_min_y = f64::MAX;
+        let mut act_max_x = f64::MIN;
+        let mut act_max_y = f64::MIN;
+
+        for path in &base_active_paths {
+            let pts: Vec<kurbo::Point> = path.iter().map(|pt| apply_axis(pt, base_act_max_x, base_act_max_y)).collect();
+            for pt in &pts {
+                if pt.x < act_min_x { act_min_x = pt.x; }
+                if pt.x > act_max_x { act_max_x = pt.x; }
+                if pt.y < act_min_y { act_min_y = pt.y; }
+                if pt.y > act_max_y { act_max_y = pt.y; }
+            }
+            active_paths.push(pts);
+        }
+
+        for path in &base_inactive_paths {
+            let pts: Vec<kurbo::Point> = path.iter().map(|pt| apply_axis(pt, doc_max_x, doc_max_y)).collect();
+            inactive_paths.push(pts);
+        }
+
+        let active_bounds = if act_min_x <= act_max_x && act_min_y <= act_max_y {
+            (act_min_x, act_min_y, act_max_x, act_max_y)
+        } else {
+            (0.0, 0.0, 0.0, 0.0)
+        };
+
+        let weeding_box = if self.add_weeding_box && !active_paths.is_empty() && act_min_x <= act_max_x {
+            let wm = self.weeding_margin;
+            let bx0 = (act_min_x - wm).max(0.0);
+            let by0 = (act_min_y - wm).max(0.0);
+            let bx1 = act_max_x + wm;
+            let by1 = act_max_y + wm;
+            Some(vec![
+                kurbo::Point::new(bx0, by0),
+                kurbo::Point::new(bx1, by0),
+                kurbo::Point::new(bx1, by1),
+                kurbo::Point::new(bx0, by1),
+                kurbo::Point::new(bx0, by0),
+            ])
+        } else {
+            None
+        };
+
+        TransformedOutput {
+            active_paths,
+            inactive_paths,
+            weeding_box,
+            bounds: (doc_min_x, doc_min_y, doc_max_x, doc_max_y),
+            active_bounds,
+        }
+    }
+
+    /// Compute both canvas and machine transforms if dirty and store them in the cache.
+    fn ensure_transform_computed(&mut self) {
+        if self.transform_dirty {
+            let canvas = self.compute_transform(
+                self.canvas_flip_x,
+                self.canvas_flip_y,
+                self.canvas_swap_xy,
+            );
+            let machine = self.compute_transform(
+                self.machine_flip_x,
+                self.machine_flip_y,
+                self.machine_swap_xy,
+            );
+            self.canvas_cache = Some(canvas);
+            self.machine_cache = Some(machine);
+            self.transform_dirty = false;
+        }
     }
 
     fn log(&mut self, msg: String) {
@@ -621,10 +916,21 @@ impl RedsailGuiApp {
             self.custom_width_mm = 30.0;
             self.custom_height_mm = 30.0;
         }
+        self.transform_dirty = true;
     }
 
     fn add_svg_content(&mut self, content: &str, label: &str, path: Option<&Path>) {
-        match parse_svg(content, 0.05) {
+        // Quick reject: content must look like XML/SVG before we attempt a parse
+        let trimmed = content.trim_start();
+        if !trimmed.starts_with("<?xml") && !trimmed.starts_with("<svg") && !trimmed.starts_with("<SVG") {
+            self.log(format!(
+                "Failed to parse file '{}': content does not appear to be an SVG/XML file",
+                label
+            ));
+            return;
+        }
+
+        match parse_svg(content, self.flatten_tolerance) {
             Ok(mut doc) => {
                 doc.filename = path
                     .and_then(|p| p.file_name())
@@ -643,8 +949,34 @@ impl RedsailGuiApp {
     }
 
     fn add_svg_from_path(&mut self, path: &Path) {
+        // Reject directories — read_to_string on a directory errors, but check up front for a clearer message
+        if let Ok(metadata) = fs::metadata(path) {
+            if metadata.is_dir() {
+                self.log(format!("Failed to read file '{}': path is a directory, not a file", path.display()));
+                return;
+            }
+        }
+
+        // Sanity-check file size to avoid OOM on accidentally-opened huge files
+        if let Ok(metadata) = fs::metadata(path) {
+            const MAX_FILE_BYTES: u64 = 50_000_000; // 50 MB cap
+            if metadata.len() > MAX_FILE_BYTES {
+                self.log(format!(
+                    "Failed to read file '{}': file is {:.1} MB, exceeds {:.1} MB limit",
+                    path.display(),
+                    metadata.len() as f64 / 1_000_000.0,
+                    MAX_FILE_BYTES as f64 / 1_000_000.0
+                ));
+                return;
+            }
+        }
+
         match fs::read_to_string(path) {
             Ok(content) => {
+                if content.trim().is_empty() {
+                    self.log(format!("Failed to read file '{}': file is empty", path.display()));
+                    return;
+                }
                 let label = path
                     .file_name()
                     .map(|f| f.to_string_lossy().to_string())
@@ -663,16 +995,19 @@ impl RedsailGuiApp {
         self.orig_height_mm = 30.0;
         self.custom_width_mm = 30.0;
         self.custom_height_mm = 30.0;
+        self.transform_dirty = true;
         self.log("Cleared all loaded design files.".to_string());
     }
 
     fn select_all(&mut self, sel: bool) {
+        self.transform_dirty = true;
         for doc in &mut self.loaded_docs {
             doc.set_selected_recursive(sel);
         }
     }
 
     fn invert_selection(&mut self) {
+        self.transform_dirty = true;
         for doc in &mut self.loaded_docs {
             doc.invert_selected_recursive();
         }
@@ -692,6 +1027,15 @@ impl RedsailGuiApp {
             return;
         }
         let path = PathBuf::from(input);
+
+        // Reject directories up front
+        if let Ok(metadata) = fs::metadata(&path) {
+            if metadata.is_dir() {
+                self.log(format!("File does not exist: '{}' is a directory", input));
+                return;
+            }
+        }
+
         if path.exists() {
             self.add_svg_from_path(&path);
         } else if input == "test_cut.svg" {
@@ -703,174 +1047,26 @@ impl RedsailGuiApp {
         }
     }
 
-    fn transform_paths(&self) -> TransformedOutput {
-        let mut all_paths: Vec<(Vec<kurbo::Point>, bool)> = Vec::new();
-        for doc in &self.loaded_docs {
-            doc.collect_all_paths(&mut all_paths);
-        }
 
-        if all_paths.is_empty() {
-            return TransformedOutput::default();
-        }
-
-        let mut doc_min_x = f64::MAX;
-        let mut doc_min_y = f64::MAX;
-        let mut doc_max_x = f64::MIN;
-        let mut doc_max_y = f64::MIN;
-
-        let mut act_raw_min_x = f64::MAX;
-        let mut act_raw_min_y = f64::MAX;
-        let mut act_raw_max_y = f64::MIN;
-        let mut has_active = false;
-
-        for (path, is_active) in &all_paths {
-            for pt in path {
-                if pt.x < doc_min_x { doc_min_x = pt.x; }
-                if pt.x > doc_max_x { doc_max_x = pt.x; }
-                if pt.y < doc_min_y { doc_min_y = pt.y; }
-                if pt.y > doc_max_y { doc_max_y = pt.y; }
-
-                if *is_active {
-                    has_active = true;
-                    if pt.x < act_raw_min_x { act_raw_min_x = pt.x; }
-                    if pt.y < act_raw_min_y { act_raw_min_y = pt.y; }
-                    if pt.y > act_raw_max_y { act_raw_max_y = pt.y; }
-                }
-            }
-        }
-
-        if doc_min_x > doc_max_x || doc_min_y > doc_max_y {
-            doc_min_x = 0.0; doc_max_x = 0.0;
-            doc_min_y = 0.0; doc_max_y = 0.0;
-        }
-        if act_raw_min_y > act_raw_max_y {
-            act_raw_min_x = 0.0;
-            act_raw_min_y = 0.0;
-            act_raw_max_y = 0.0;
-        }
-
-        let (eff_scale_x, eff_scale_y) = if self.orig_width_mm > 0.0 && self.orig_height_mm > 0.0 {
-            (
-                self.custom_width_mm / self.orig_width_mm,
-                self.custom_height_mm / self.orig_height_mm,
-            )
-        } else {
-            (self.scale, self.scale)
-        };
-
-        let margin_mm = (self.blade_offset * 2.0).max(2.0);
-        let extra_offset = if self.add_weeding_box { self.weeding_margin } else { 0.0 };
-        let base_offset = margin_mm + extra_offset;
-
-        let mut active_paths: Vec<Vec<kurbo::Point>> = Vec::new();
-        let mut inactive_paths: Vec<Vec<kurbo::Point>> = Vec::new();
-
-        let mut act_min_x = f64::MAX;
-        let mut act_min_y = f64::MAX;
-        let mut act_max_x = f64::MIN;
-        let mut act_max_y = f64::MIN;
-
-        for (path, is_active) in all_paths {
-            let pts: Vec<kurbo::Point> = path
-                .iter()
-                .map(|pt| {
-                    let (norm_x, norm_y, offset_x, offset_y) = if self.pos_active_only && has_active {
-                        if is_active {
-                            // Active paths zero-normalize to active cut bounds and offset by user pos_x/pos_y
-                            let nx = if self.normalize_origin { pt.x - act_raw_min_x } else { pt.x };
-                            let ny = if self.flip_y {
-                                act_raw_max_y - pt.y
-                            } else if self.normalize_origin {
-                                pt.y - act_raw_min_y
-                            } else {
-                                pt.y
-                            };
-                            (nx, ny, self.pos_x_mm, self.pos_y_mm)
-                        } else {
-                            // Inactive paths remain at baseline document coordinates as reference
-                            let nx = if self.normalize_origin { pt.x - doc_min_x } else { pt.x };
-                            let ny = if self.flip_y {
-                                doc_max_y - pt.y
-                            } else if self.normalize_origin {
-                                pt.y - doc_min_y
-                            } else {
-                                pt.y
-                            };
-                            (nx, ny, 0.0, 0.0)
-                        }
-                    } else {
-                        // All paths normalized together to document bounds and shifted together
-                        let nx = if self.normalize_origin { pt.x - doc_min_x } else { pt.x };
-                        let ny = if self.flip_y {
-                            doc_max_y - pt.y
-                        } else if self.normalize_origin {
-                            pt.y - doc_min_y
-                        } else {
-                            pt.y
-                        };
-                        (nx, ny, self.pos_x_mm, self.pos_y_mm)
-                    };
-
-                    let mut x = norm_x * eff_scale_x + base_offset + offset_x;
-                    let mut y = norm_y * eff_scale_y + base_offset + offset_y;
-
-                    if self.swap_xy {
-                        std::mem::swap(&mut x, &mut y);
-                    }
-
-                    kurbo::Point::new(x, y)
-                })
-                .collect();
-
-            if is_active {
-                for pt in &pts {
-                    if pt.x < act_min_x { act_min_x = pt.x; }
-                    if pt.x > act_max_x { act_max_x = pt.x; }
-                    if pt.y < act_min_y { act_min_y = pt.y; }
-                    if pt.y > act_max_y { act_max_y = pt.y; }
-                }
-                active_paths.push(pts);
-            } else {
-                inactive_paths.push(pts);
-            }
-        }
-
-        let active_bounds = if act_min_x <= act_max_x && act_min_y <= act_max_y {
-            (act_min_x, act_min_y, act_max_x, act_max_y)
-        } else {
-            (0.0, 0.0, 0.0, 0.0)
-        };
-
-        let weeding_box = if self.add_weeding_box && !active_paths.is_empty() && act_min_x <= act_max_x {
-            let wm = self.weeding_margin;
-            let bx0 = (act_min_x - wm).max(0.0);
-            let by0 = (act_min_y - wm).max(0.0);
-            let bx1 = act_max_x + wm;
-            let by1 = act_max_y + wm;
-            Some(vec![
-                kurbo::Point::new(bx0, by0),
-                kurbo::Point::new(bx1, by0),
-                kurbo::Point::new(bx1, by1),
-                kurbo::Point::new(bx0, by1),
-                kurbo::Point::new(bx0, by0),
-            ])
-        } else {
-            None
-        };
-
-        TransformedOutput {
-            active_paths,
-            inactive_paths,
-            weeding_box,
-            bounds: (doc_min_x, doc_min_y, doc_max_x, doc_max_y),
-            active_bounds,
-        }
-    }
-
-    fn generate_current_hpgl(&self) -> Result<(String, usize), String> {
-        let output = self.transform_paths();
+    fn generate_current_hpgl(&mut self) -> Result<(String, usize), String> {
+        self.ensure_transform_computed();
+        let output = self.machine_cache.as_ref().unwrap().clone();
         if output.active_paths.is_empty() {
             return Err("No vector paths selected to cut. Please check at least one layer or path in the Design Hierarchy tree.".to_string());
+        }
+
+        // Impossible-cut prevention: validate plotter max width and min feature size.
+        let limits = cut_validation::CutLimits {
+            max_cut_width_mm: Some(self.max_cut_width),
+            max_cut_length_mm: None, // feed length unlimited
+            min_feature_mm: self.min_feature,
+        };
+        if let Err(e) = cut_validation::validate_cut_limits(
+            &output.active_paths,
+            output.weeding_box.as_ref(),
+            &limits,
+        ) {
+            return Err(e);
         }
 
         let settings = CutterSettings {
@@ -884,6 +1080,8 @@ impl RedsailGuiApp {
         let mut total_points = 0;
 
         // 1. Cut all active/selected design paths first
+        // Machine axis controls (flip_x/flip_y/swap_xy) already applied in compute_transform.
+        // Plotter X/Y swapped: HP-GL PU{x},{y} where x=feed, y=carriage.
         for path in &output.active_paths {
             if path.is_empty() {
                 continue;
@@ -895,9 +1093,9 @@ impl RedsailGuiApp {
 
             total_points += compensated.len();
             let start = compensated[0];
-            builder.pen_up(mm_to_plotter(start.x), mm_to_plotter(start.y));
+            builder.pen_up(mm_to_plotter(start.y), mm_to_plotter(start.x));
             for pt in &compensated[1..] {
-                builder.pen_down(mm_to_plotter(pt.x), mm_to_plotter(pt.y));
+                builder.pen_down(mm_to_plotter(pt.y), mm_to_plotter(pt.x));
             }
             builder.pen_up_in_place();
         }
@@ -908,9 +1106,9 @@ impl RedsailGuiApp {
             if !compensated_box.is_empty() {
                 total_points += compensated_box.len();
                 let start = compensated_box[0];
-                builder.pen_up(mm_to_plotter(start.x), mm_to_plotter(start.y));
+                builder.pen_up(mm_to_plotter(start.y), mm_to_plotter(start.x));
                 for pt in &compensated_box[1..] {
-                    builder.pen_down(mm_to_plotter(pt.x), mm_to_plotter(pt.y));
+                    builder.pen_down(mm_to_plotter(pt.y), mm_to_plotter(pt.x));
                 }
                 builder.pen_up_in_place();
             }
@@ -941,9 +1139,25 @@ impl RedsailGuiApp {
             return;
         }
 
-        let output = self.transform_paths();
+        self.ensure_transform_computed();
+        let output = self.machine_cache.as_ref().unwrap().clone();
         if output.active_paths.is_empty() {
             self.log("[Warning] No active vector paths to trace. Please check at least one layer in Artwork & Layers.".to_string());
+            return;
+        }
+
+        // Impossible-cut prevention: validate plotter max width and min feature size.
+        let limits = cut_validation::CutLimits {
+            max_cut_width_mm: Some(self.max_cut_width),
+            max_cut_length_mm: None, // feed length unlimited
+            min_feature_mm: self.min_feature,
+        };
+        if let Err(e) = cut_validation::validate_cut_limits(
+            &output.active_paths,
+            output.weeding_box.as_ref(),
+            &limits,
+        ) {
+            self.log(format!("[Error] {}", e));
             return;
         }
 
@@ -1008,11 +1222,11 @@ impl RedsailGuiApp {
         let p3_x = mm_to_plotter(min_x);
         let p3_y = mm_to_plotter(max_y);
 
-        builder.pen_up(p0_x, p0_y);
-        builder.pen_up(p1_x, p1_y);
-        builder.pen_up(p2_x, p2_y);
-        builder.pen_up(p3_x, p3_y);
-        builder.pen_up(p0_x, p0_y);
+        builder.pen_up(p0_y, p0_x);
+        builder.pen_up(p1_y, p1_x);
+        builder.pen_up(p2_y, p2_x);
+        builder.pen_up(p3_y, p3_x);
+        builder.pen_up(p0_y, p0_x);
 
         let hpgl = builder.finish();
 
@@ -1101,12 +1315,14 @@ impl RedsailGuiApp {
             return;
         }
 
+        // On this Redsail plotter the carriage (left/right) is wired to the plotter's Y axis,
+        // so carriage jog updates cutter_y_steps and the second HP-GL coordinate.
         let d_steps = (d_mm * 40.0).round() as i32;
         self.cutter_y_steps += d_steps;
         let cmd = format!("PA;PU{},{};", self.cutter_x_steps, self.cutter_y_steps);
         let desc = format!("Carriage move {:+.1} mm (Y={:.1} mm)", d_mm, self.cutter_y_steps as f64 / 40.0);
         self.send_raw_command(&cmd, &desc);
-        self.est_pos_x = (self.cutter_y_steps as f64 / 40.0 * 10.0).round() / 10.0;
+        self.est_pos_y = (self.cutter_y_steps as f64 / 40.0 * 10.0).round() / 10.0;
     }
 
     fn jog_feed(&mut self, d_mm: f64) {
@@ -1115,12 +1331,14 @@ impl RedsailGuiApp {
             return;
         }
 
+        // On this Redsail plotter the vinyl feed (forward/back) is wired to the plotter's X axis,
+        // so feed jog updates cutter_x_steps and the first HP-GL coordinate.
         let d_steps = (d_mm * 40.0).round() as i32;
         self.cutter_x_steps += d_steps;
         let cmd = format!("PA;PU{},{};", self.cutter_x_steps, self.cutter_y_steps);
         let desc = format!("Feed move {:+.1} mm (X={:.1} mm)", d_mm, self.cutter_x_steps as f64 / 40.0);
         self.send_raw_command(&cmd, &desc);
-        self.est_pos_y = (self.cutter_x_steps as f64 / 40.0 * 10.0).round() / 10.0;
+        self.est_pos_x = (self.cutter_x_steps as f64 / 40.0 * 10.0).round() / 10.0;
     }
 
     fn go_home(&mut self) {
@@ -1137,15 +1355,18 @@ impl RedsailGuiApp {
             return;
         }
 
-        let target_y_steps = (x_mm * 40.0).round() as i32;
-        let target_x_steps = (y_mm * 40.0).round() as i32;
-        self.cutter_y_steps = target_y_steps;
+        // On this swapped-axis Redsail plotter:
+        //   X axis = vinyl feed, Y axis = carriage
+        //   HP-GL PU{x},{y}: first coord = feed(X), second coord = carriage(Y)
+        let target_x_steps = (y_mm * 40.0).round() as i32; // feed position -> first coord
+        let target_y_steps = (x_mm * 40.0).round() as i32; // carriage position -> second coord
         self.cutter_x_steps = target_x_steps;
+        self.cutter_y_steps = target_y_steps;
         let cmd = format!("PA;PU{},{};", self.cutter_x_steps, self.cutter_y_steps);
-        let desc = format!("Rapid move to X={:.1} mm, Y={:.1} mm", x_mm, y_mm);
+        let desc = format!("Rapid move to Feed(X)={:.1} mm, Carriage(Y)={:.1} mm", y_mm, x_mm);
         self.send_raw_command(&cmd, &desc);
-        self.est_pos_x = (x_mm * 10.0).round() / 10.0;
-        self.est_pos_y = (y_mm * 10.0).round() / 10.0;
+        self.est_pos_x = (y_mm * 10.0).round() / 10.0;
+        self.est_pos_y = (x_mm * 10.0).round() / 10.0;
     }
 
     fn set_origin_here(&mut self) {
@@ -1238,6 +1459,9 @@ impl eframe::App for RedsailGuiApp {
             }
         }
 
+        // Ensure transform cache is computed before UI reads dimensions
+        self.ensure_transform_computed();
+
         // Top Panel: Header & Main Toolbar
         egui::TopBottomPanel::top("header_panel")
             .frame(egui::Frame::NONE.fill(Color32::from_rgb(18, 20, 26)).inner_margin(egui::Margin::symmetric(14, 8)))
@@ -1305,7 +1529,10 @@ impl eframe::App for RedsailGuiApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(egui::RichText::new(format!("{} baud | {}", self.baud, self.flow_mode)).size(11.0).color(Color32::DARK_GRAY));
                         ui.separator();
-                        let cut_dist = self.total_cut_length_mm();
+                        let cut_dist = {
+                            self.ensure_transform_computed();
+                            RedsailGuiApp::total_cut_length_mm(self.machine_cache.as_ref().unwrap())
+                        };
                         ui.label(egui::RichText::new(format!("Total Cut Distance: {:.1} mm", cut_dist)).size(11.0).color(Color32::from_rgb(0, 180, 240)));
                     });
                 });
@@ -1395,6 +1622,7 @@ impl eframe::App for RedsailGuiApp {
                                 );
                             } else {
                                 let mut remove_idx = None;
+                                let mut tree_dirty = false;
                                 for (idx, doc) in self.loaded_docs.iter_mut().enumerate() {
                                     let d_total = doc.total_paths();
                                     let d_sel = doc.selected_paths();
@@ -1408,12 +1636,13 @@ impl eframe::App for RedsailGuiApp {
                                         }
 
                                         let mut checked = is_all;
-                                        if ui.checkbox(&mut checked, "").clicked() {
+                                        if dot_checkbox(ui, &mut checked, "").clicked() {
                                             if is_all {
                                                 doc.set_selected_recursive(false);
                                             } else {
                                                 doc.set_selected_recursive(true);
                                             }
+                                            self.transform_dirty = true;
                                         }
 
                                         let doc_color = if is_all {
@@ -1450,12 +1679,16 @@ impl eframe::App for RedsailGuiApp {
 
                                     if doc.expanded {
                                         for sub_grp in &mut doc.root_group.groups {
-                                            render_group_item(ui, sub_grp, 1);
+                                            render_group_item(ui, sub_grp, 1, &mut tree_dirty);
                                         }
                                         for path in &mut doc.root_group.paths {
-                                            render_path_item(ui, path, 1);
+                                            render_path_item(ui, path, 1, &mut tree_dirty);
                                         }
                                     }
+                                }
+
+                                if tree_dirty {
+                                    self.transform_dirty = true;
                                 }
 
                                 if let Some(i) = remove_idx {
@@ -1478,22 +1711,26 @@ impl eframe::App for RedsailGuiApp {
                                 self.scale = 2.0;
                                 self.custom_width_mm = (self.orig_width_mm * 2.0 * 10.0).round() / 10.0;
                                 self.custom_height_mm = (self.orig_height_mm * 2.0 * 10.0).round() / 10.0;
+                                self.transform_dirty = true;
                             }
                             if ui.small_button("100%").clicked() && self.orig_width_mm > 0.0 {
                                 self.scale = 1.0;
                                 self.custom_width_mm = self.orig_width_mm;
                                 self.custom_height_mm = self.orig_height_mm;
+                                self.transform_dirty = true;
                             }
                             if ui.small_button("50%").clicked() && self.orig_width_mm > 0.0 {
                                 self.scale = 0.5;
                                 self.custom_width_mm = (self.orig_width_mm * 0.5 * 10.0).round() / 10.0;
                                 self.custom_height_mm = (self.orig_height_mm * 0.5 * 10.0).round() / 10.0;
+                                self.transform_dirty = true;
                             }
                         });
                     });
 
+                    // Width / Height row with aspect ratio badge
                     ui.horizontal(|ui| {
-                        ui.label("Width:");
+                        ui.label(egui::RichText::new("Width:").strong()).on_hover_text("Artwork width in millimetres");
                         let w_resp = ui.add(
                             egui::DragValue::new(&mut self.custom_width_mm)
                                 .speed(0.5)
@@ -1501,15 +1738,18 @@ impl eframe::App for RedsailGuiApp {
                                 .max_decimals(1)
                                 .suffix(" mm"),
                         );
-                        if w_resp.changed() && self.lock_aspect_ratio && self.orig_width_mm > 0.0 {
-                            let ratio = self.custom_width_mm / self.orig_width_mm;
-                            self.custom_height_mm = (self.orig_height_mm * ratio * 10.0).round() / 10.0;
-                            self.scale = ratio;
+                        if w_resp.changed() {
+                            self.transform_dirty = true;
+                            if self.lock_aspect_ratio && self.orig_width_mm > 0.0 {
+                                let ratio = self.custom_width_mm / self.orig_width_mm;
+                                self.custom_height_mm = (self.orig_height_mm * ratio * 10.0).round() / 10.0;
+                                self.scale = ratio;
+                            }
                         }
 
-                        ui.add_space(8.0);
+                        ui.add_space(12.0);
 
-                        ui.label("Height:");
+                        ui.label(egui::RichText::new("Height:").strong()).on_hover_text("Artwork height in millimetres");
                         let h_resp = ui.add(
                             egui::DragValue::new(&mut self.custom_height_mm)
                                 .speed(0.5)
@@ -1517,16 +1757,33 @@ impl eframe::App for RedsailGuiApp {
                                 .max_decimals(1)
                                 .suffix(" mm"),
                         );
-                        if h_resp.changed() && self.lock_aspect_ratio && self.orig_height_mm > 0.0 {
-                            let ratio = self.custom_height_mm / self.orig_height_mm;
-                            self.custom_width_mm = (self.orig_width_mm * ratio * 10.0).round() / 10.0;
-                            self.scale = ratio;
+                        if h_resp.changed() {
+                            self.transform_dirty = true;
+                            if self.lock_aspect_ratio && self.orig_height_mm > 0.0 {
+                                let ratio = self.custom_height_mm / self.orig_height_mm;
+                                self.custom_width_mm = (self.orig_width_mm * ratio * 10.0).round() / 10.0;
+                                self.scale = ratio;
+                            }
                         }
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let lock_icon = if self.lock_aspect_ratio {
+                                format!("{} Locked", icons::LOCK)
+                            } else {
+                                format!("{} Free", icons::LOCK_OPEN)
+                            };
+                            let lock_changed = dot_checkbox(ui, &mut self.lock_aspect_ratio, &lock_icon).changed();
+                            if lock_changed {
+                                self.transform_dirty = true;
+                            }
+                        });
                     });
 
+                    // Position row
+                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        ui.label("Pos X:");
-                        ui.add(
+                        ui.label(egui::RichText::new("Pos X:").strong()).on_hover_text("Horizontal offset from origin");
+                        let px_resp = ui.add(
                             egui::DragValue::new(&mut self.pos_x_mm)
                                 .speed(0.5)
                                 .range(0.0..=2000.0)
@@ -1534,10 +1791,10 @@ impl eframe::App for RedsailGuiApp {
                                 .suffix(" mm"),
                         );
 
-                        ui.add_space(8.0);
+                        ui.add_space(12.0);
 
-                        ui.label("Pos Y:");
-                        ui.add(
+                        ui.label(egui::RichText::new("Pos Y:").strong()).on_hover_text("Vertical offset from origin");
+                        let py_resp = ui.add(
                             egui::DragValue::new(&mut self.pos_y_mm)
                                 .speed(0.5)
                                 .range(0.0..=5000.0)
@@ -1545,26 +1802,31 @@ impl eframe::App for RedsailGuiApp {
                                 .suffix(" mm"),
                         );
 
+                        if px_resp.changed() || py_resp.changed() {
+                            self.transform_dirty = true;
+                        }
+
                         if (self.pos_x_mm != 0.0 || self.pos_y_mm != 0.0)
-                            && ui.small_button("Reset (0,0)").on_hover_text("Reset position offsets to 0,0").clicked()
+                            && ui.small_button("Reset 0,0").on_hover_text("Reset position offsets to 0,0").clicked()
                         {
                             self.pos_x_mm = 0.0;
                             self.pos_y_mm = 0.0;
+                            self.transform_dirty = true;
                         }
                     });
 
                     ui.horizontal(|ui| {
-                        ui.checkbox(&mut self.pos_active_only, "Active Cut Only")
+                        dot_checkbox(ui, &mut self.pos_active_only, "Active Cut Only")
                             .on_hover_text("When checked, position offsets and zero alignment apply strictly to the selected/active cut paths");
                         if self.pos_active_only {
                             ui.label(
-                                egui::RichText::new("(Positions active layer)")
+                                egui::RichText::new("(active layer only)")
                                     .size(10.0)
                                     .color(Color32::from_rgb(0, 210, 255)),
                             );
                         } else {
                             ui.label(
-                                egui::RichText::new("(Positions all artwork)")
+                                egui::RichText::new("(all artwork)")
                                     .size(10.0)
                                     .color(Color32::from_rgb(140, 150, 170)),
                             );
@@ -1577,29 +1839,56 @@ impl eframe::App for RedsailGuiApp {
                         } else {
                             format!("{} Aspect Ratio: Free", icons::LOCK_OPEN)
                         };
-                        ui.checkbox(&mut self.lock_aspect_ratio, lock_icon);
+                        dot_checkbox(ui, &mut self.lock_aspect_ratio, &lock_icon);
+                        ui.separator();
+
+                        // Axis controls — Canvas (display) vs Machine (cutting)
+                        ui.collapsing("Axis Controls", |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Canvas:");
+                                let cf_x = dot_checkbox(ui, &mut self.canvas_flip_x, "Flip X").changed();
+                                let cf_y = dot_checkbox(ui, &mut self.canvas_flip_y, "Flip Y").changed();
+                                let cf_s = dot_checkbox(ui, &mut self.canvas_swap_xy, "Swap X/Y").changed();
+                                if cf_x || cf_y || cf_s { self.transform_dirty = true; }
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Machine:");
+                                let mf_x = dot_checkbox(ui, &mut self.machine_flip_x, "Flip X").changed();
+                                let mf_y = dot_checkbox(ui, &mut self.machine_flip_y, "Flip Y").changed();
+                                let mf_s = dot_checkbox(ui, &mut self.machine_swap_xy, "Swap X/Y").changed();
+                                if mf_x || mf_y || mf_s { self.transform_dirty = true; }
+                            });
+                        });
                     });
 
                     // Weeding Border inside Dimensions
                     ui.separator();
                     ui.horizontal(|ui| {
-                        ui.checkbox(&mut self.add_weeding_box, "Weeding Border");
+                        let weeding_changed = dot_checkbox(ui, &mut self.add_weeding_box, "Weeding Border").changed();
                         if self.add_weeding_box {
-                            ui.add(
+                            let margin_changed = ui.add(
                                 egui::Slider::new(&mut self.weeding_margin, 1.0..=25.0)
                                     .step_by(0.5)
                                     .suffix(" mm"),
-                            );
+                            ).changed();
+                            if weeding_changed || margin_changed {
+                                self.transform_dirty = true;
+                            }
+                        } else if weeding_changed {
+                            self.transform_dirty = true;
                         }
                     });
 
                     if self.developer_mode {
                         ui.separator();
-                        ui.label(egui::RichText::new("Axes Alignment:").size(11.0).color(Color32::GRAY));
+                        ui.label(egui::RichText::new("Axes Alignment (canvas):").size(11.0).color(Color32::GRAY));
                         ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.normalize_origin, "Auto-Zero");
-                            ui.checkbox(&mut self.flip_y, "Flip Y");
-                            ui.checkbox(&mut self.swap_xy, "Swap X/Y");
+                            let nz_changed = dot_checkbox(ui, &mut self.normalize_origin, "Auto-Zero").changed();
+                            let cf_x = dot_checkbox(ui, &mut self.canvas_flip_x, "Flip X").changed();
+                            let cf_y = dot_checkbox(ui, &mut self.canvas_flip_y, "Flip Y").changed();
+                            if nz_changed || cf_x || cf_y {
+                                self.transform_dirty = true;
+                            }
                         });
                     }
                 });
@@ -1620,6 +1909,7 @@ impl eframe::App for RedsailGuiApp {
                                         self.speed = sp;
                                         self.force = fo;
                                         self.blade_offset = off;
+                                        self.transform_dirty = true;
                                         self.log(format!("Applied preset: {} (Speed: {} cm/s, Force: {} g, Offset: {:.2} mm)", preset.name(), sp, fo, off));
                                     }
                                 }
@@ -1642,6 +1932,41 @@ impl eframe::App for RedsailGuiApp {
                         ).changed()
                     {
                         self.selected_preset = MaterialPreset::Custom;
+                        self.transform_dirty = true;
+                    }
+
+                    if self.developer_mode
+                        && ui.add(
+                            egui::Slider::new(&mut self.flatten_tolerance, 0.02..=1.0)
+                                .step_by(0.01)
+                                .text("Flatten Tolerance (mm)"),
+                        ).changed()
+                    {
+                        self.selected_preset = MaterialPreset::Custom;
+                        self.transform_dirty = true;
+                        self.log(format!("Flatten tolerance changed to {:.2} mm — re-load SVGs to apply.", self.flatten_tolerance));
+                    }
+
+                    if self.developer_mode
+                        && ui.add(
+                            egui::Slider::new(&mut self.max_cut_width, 50.0..=2000.0)
+                                .step_by(10.0)
+                                .text("Max Cut Width (mm)"),
+                        ).changed()
+                    {
+                        self.selected_preset = MaterialPreset::Custom;
+                        self.transform_dirty = true;
+                    }
+
+                    if self.developer_mode
+                        && ui.add(
+                            egui::Slider::new(&mut self.min_feature, 0.0..=5.0)
+                                .step_by(0.05)
+                                .text("Min Feature Size (mm)"),
+                        ).changed()
+                    {
+                        self.selected_preset = MaterialPreset::Custom;
+                        self.transform_dirty = true;
                     }
                 });
 
@@ -1692,13 +2017,12 @@ impl eframe::App for RedsailGuiApp {
                             self.execute_test_box();
                         }
 
-                        if self.developer_mode {
-                            if ui.add_sized([btn_w, 28.0], egui::Button::new(format!("{} Test Cut", icons::SCISSORS)))
+                        if self.developer_mode
+                            && ui.add_sized([btn_w, 28.0], egui::Button::new(format!("{} Test Cut", icons::SCISSORS)))
                                 .on_hover_text("Cut small calibration pattern (square & circle)")
                                 .clicked()
-                            {
-                                self.execute_test_pattern();
-                            }
+                        {
+                            self.execute_test_pattern();
                         }
                     });
 
@@ -1972,14 +2296,31 @@ impl eframe::App for RedsailGuiApp {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Interactive CAD Canvas").strong().size(13.0));
                 ui.separator();
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Cut Dimensions: {:.1} mm × {:.1} mm",
-                        self.custom_width_mm, self.custom_height_mm
-                    ))
-                    .strong()
-                    .color(Color32::from_rgb(0, 200, 255)),
-                );
+                ui.label({
+                    let mut w = self.custom_width_mm;
+                    let mut h = self.custom_height_mm;
+                    if let Some(out) = &self.canvas_cache {
+                        let mut min_x = f64::MAX;
+                        let mut min_y = f64::MAX;
+                        let mut max_x = f64::MIN;
+                        let mut max_y = f64::MIN;
+                        for path in &out.active_paths {
+                            for pt in path {
+                                if pt.x < min_x { min_x = pt.x; }
+                                if pt.x > max_x { max_x = pt.x; }
+                                if pt.y < min_y { min_y = pt.y; }
+                                if pt.y > max_y { max_y = pt.y; }
+                            }
+                        }
+                        if min_x <= max_x && min_y <= max_y {
+                            w = (max_x - min_x).max(0.0);
+                            h = (max_y - min_y).max(0.0);
+                        }
+                    }
+                    egui::RichText::new(format!("Cut Dimensions: {:.1} mm × {:.1} mm", w, h))
+                        .strong()
+                        .color(Color32::from_rgb(0, 200, 255))
+                });
 
                 let sel_p = self.selected_paths_count();
                 let tot_p = self.total_paths_count();
@@ -2012,6 +2353,11 @@ impl eframe::App for RedsailGuiApp {
                             &mut self.canvas_origin_corner,
                             CanvasOriginCorner::BottomRight,
                             "Bottom-Right (Machine Standard)",
+                        );
+                        ui.selectable_value(
+                            &mut self.canvas_origin_corner,
+                            CanvasOriginCorner::BottomLeft,
+                            "Bottom-Left (CAD Standard)",
                         );
                         ui.selectable_value(
                             &mut self.canvas_origin_corner,
@@ -2078,17 +2424,48 @@ impl eframe::App for RedsailGuiApp {
             painter.rect_filled(canvas_rect, 0.0, Color32::from_rgb(17, 18, 24));
 
             let base_origin = match self.canvas_origin_corner {
+                CanvasOriginCorner::BottomLeft => canvas_rect.left_bottom() + Vec2::new(50.0, -50.0),
                 CanvasOriginCorner::BottomRight => canvas_rect.right_bottom() - Vec2::new(50.0, 50.0),
                 CanvasOriginCorner::TopLeft => canvas_rect.left_top() + Vec2::new(50.0, 50.0),
             };
             let origin = base_origin + self.canvas_pan;
 
-            // Transform paths
-            let output = self.transform_paths();
+            // Transform paths (cached — only recomputes when transform-relevant state changes)
+            self.ensure_transform_computed();
+            let output = self.canvas_cache.as_ref().unwrap().clone();
             let has_paths = !output.active_paths.is_empty() || !output.inactive_paths.is_empty();
 
-            let max_w = (self.custom_width_mm + self.pos_x_mm + (self.weeding_margin * 2.0)).max(10.0);
-            let max_h = (self.custom_height_mm + self.pos_y_mm + (self.weeding_margin * 2.0)).max(10.0);
+            // Compute actual output bounds (accounts for mirror, scale, flip, etc.)
+            let (out_min_x, out_min_y, out_max_x, out_max_y) = {
+                let mut min_x = f64::MAX;
+                let mut min_y = f64::MAX;
+                let mut max_x = f64::MIN;
+                let mut max_y = f64::MIN;
+                for path in &output.active_paths {
+                    for pt in path {
+                        if pt.x < min_x { min_x = pt.x; }
+                        if pt.x > max_x { max_x = pt.x; }
+                        if pt.y < min_y { min_y = pt.y; }
+                        if pt.y > max_y { max_y = pt.y; }
+                    }
+                }
+                if let Some(wbox) = &output.weeding_box {
+                    for pt in wbox {
+                        if pt.x < min_x { min_x = pt.x; }
+                        if pt.x > max_x { max_x = pt.x; }
+                        if pt.y < min_y { min_y = pt.y; }
+                        if pt.y > max_y { max_y = pt.y; }
+                    }
+                }
+                if min_x <= max_x && min_y <= max_y {
+                    (min_x, min_y, max_x, max_y)
+                } else {
+                    (0.0, 0.0, 0.0, 0.0)
+                }
+            };
+
+            let max_w = ((out_max_x - out_min_x).max(0.0) + (self.weeding_margin * 2.0)).max(10.0);
+            let max_h = ((out_max_y - out_min_y).max(0.0) + (self.weeding_margin * 2.0)).max(10.0);
             let max_dim = (max_w.max(max_h)) as f32;
             let avail_w = (canvas_rect.width() - 120.0).max(50.0);
             let avail_h = (canvas_rect.height() - 120.0).max(50.0);
@@ -2096,16 +2473,45 @@ impl eframe::App for RedsailGuiApp {
             let effective_zoom = auto_fit_zoom * self.canvas_zoom;
 
             let origin_corner = self.canvas_origin_corner;
-            let swap_xy = self.swap_xy;
-            let to_screen = |pt: kurbo::Point| -> Pos2 {
-                let (sx, sy) = if swap_xy {
-                    (pt.y as f32, pt.x as f32)
-                } else {
-                    (pt.x as f32, pt.y as f32)
+
+            // Canvas shows design as-is; canvas and HP-GL use identical transform output.
+            let (min_sx, max_sx) = {
+                let mut min_val = f32::MAX;
+                let mut max_val = f32::MIN;
+                let mut check_pt = |pt: &kurbo::Point| {
+                    let sx = pt.x as f32;
+                    if sx < min_val { min_val = sx; }
+                    if sx > max_val { max_val = sx; }
                 };
+                if let Some(wbox) = &output.weeding_box {
+                    for pt in wbox { check_pt(pt); }
+                }
+                for p in &output.active_paths {
+                    for pt in p { check_pt(pt); }
+                }
+                for p in &output.inactive_paths {
+                    for pt in p { check_pt(pt); }
+                }
+                if min_val > max_val {
+                    (0.0_f32, (self.custom_width_mm + self.pos_x_mm + (self.weeding_margin * 2.0)).max(10.0) as f32)
+                } else {
+                    (min_val, max_val)
+                }
+            };
+
+            let to_screen = |pt: kurbo::Point| -> Pos2 {
+                // Canvas and HP-GL use identical transform output — no swap_xy applied.
+                let sx = pt.x as f32;
+                let sy = pt.y as f32;
                 match origin_corner {
                     CanvasOriginCorner::BottomRight => {
-                        Pos2::new(origin.x - (sx * effective_zoom), origin.y - (sy * effective_zoom))
+                        Pos2::new(
+                            origin.x - ((max_sx + min_sx - sx) * effective_zoom),
+                            origin.y - (sy * effective_zoom),
+                        )
+                    }
+                    CanvasOriginCorner::BottomLeft => {
+                        Pos2::new(origin.x + (sx * effective_zoom), origin.y - (sy * effective_zoom))
                     }
                     CanvasOriginCorner::TopLeft => {
                         Pos2::new(origin.x + (sx * effective_zoom), origin.y + (sy * effective_zoom))
@@ -2125,8 +2531,20 @@ impl eframe::App for RedsailGuiApp {
                 let mut gx = 0.0;
                 while gx <= grid_w {
                     let is_major = (gx as i32 % 50) == 0;
-                    let p0 = to_screen(kurbo::Point::new(gx as f64, 0.0));
-                    let p1 = to_screen(kurbo::Point::new(gx as f64, grid_h as f64));
+                    let (p0, p1) = match origin_corner {
+                        CanvasOriginCorner::BottomLeft => (
+                            Pos2::new(origin.x + (gx * effective_zoom), origin.y),
+                            Pos2::new(origin.x + (gx * effective_zoom), origin.y - (grid_h * effective_zoom)),
+                        ),
+                        CanvasOriginCorner::BottomRight => (
+                            Pos2::new(origin.x - (gx * effective_zoom), origin.y),
+                            Pos2::new(origin.x - (gx * effective_zoom), origin.y - (grid_h * effective_zoom)),
+                        ),
+                        CanvasOriginCorner::TopLeft => (
+                            Pos2::new(origin.x + (gx * effective_zoom), origin.y),
+                            Pos2::new(origin.x + (gx * effective_zoom), origin.y + (grid_h * effective_zoom)),
+                        ),
+                    };
                     if canvas_rect.x_range().contains(p0.x) || canvas_rect.x_range().contains(p1.x) {
                         painter.line_segment([p0, p1], if is_major { major_stroke } else { minor_stroke });
                     }
@@ -2136,8 +2554,20 @@ impl eframe::App for RedsailGuiApp {
                 let mut gy = 0.0;
                 while gy <= grid_h {
                     let is_major = (gy as i32 % 50) == 0;
-                    let p0 = to_screen(kurbo::Point::new(0.0, gy as f64));
-                    let p1 = to_screen(kurbo::Point::new(grid_w as f64, gy as f64));
+                    let (p0, p1) = match origin_corner {
+                        CanvasOriginCorner::BottomLeft => (
+                            Pos2::new(origin.x, origin.y - (gy * effective_zoom)),
+                            Pos2::new(origin.x + (grid_w * effective_zoom), origin.y - (gy * effective_zoom)),
+                        ),
+                        CanvasOriginCorner::BottomRight => (
+                            Pos2::new(origin.x, origin.y - (gy * effective_zoom)),
+                            Pos2::new(origin.x - (grid_w * effective_zoom), origin.y - (gy * effective_zoom)),
+                        ),
+                        CanvasOriginCorner::TopLeft => (
+                            Pos2::new(origin.x, origin.y + (gy * effective_zoom)),
+                            Pos2::new(origin.x + (grid_w * effective_zoom), origin.y + (gy * effective_zoom)),
+                        ),
+                    };
                     if canvas_rect.y_range().contains(p0.y) || canvas_rect.y_range().contains(p1.y) {
                         painter.line_segment([p0, p1], if is_major { major_stroke } else { minor_stroke });
                     }
@@ -2152,10 +2582,45 @@ impl eframe::App for RedsailGuiApp {
             // Draw axis guides
             let axis_len = 65.0 * effective_zoom.clamp(0.6, 1.2);
             match self.canvas_origin_corner {
-                CanvasOriginCorner::BottomRight => {
+                CanvasOriginCorner::BottomLeft => {
                     painter.text(
                         origin + Vec2::new(10.0, 10.0),
                         egui::Align2::LEFT_TOP,
+                        "Origin (0,0)",
+                        egui::FontId::monospace(11.0),
+                        Color32::from_rgb(240, 240, 240),
+                    );
+
+                    // +Width (Carriage) extends Rightward
+                    painter.line_segment(
+                        [origin, origin + Vec2::new(axis_len, 0.0)],
+                        Stroke::new(1.5_f32, Color32::from_rgb(239, 68, 68)),
+                    );
+                    painter.text(
+                        origin + Vec2::new(axis_len + 4.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        "+Width (Carriage)",
+                        egui::FontId::monospace(10.0),
+                        Color32::from_rgb(255, 120, 120),
+                    );
+
+                    // +Length (Feed) extends Upward
+                    painter.line_segment(
+                        [origin, origin + Vec2::new(0.0, -axis_len)],
+                        Stroke::new(1.5_f32, Color32::from_rgb(34, 197, 94)),
+                    );
+                    painter.text(
+                        origin + Vec2::new(0.0, -axis_len - 4.0),
+                        egui::Align2::CENTER_BOTTOM,
+                        "+Length (Feed)",
+                        egui::FontId::monospace(10.0),
+                        Color32::from_rgb(100, 255, 140),
+                    );
+                }
+                CanvasOriginCorner::BottomRight => {
+                    painter.text(
+                        origin + Vec2::new(-10.0, 10.0),
+                        egui::Align2::RIGHT_TOP,
                         "Origin (0,0)",
                         egui::FontId::monospace(11.0),
                         Color32::from_rgb(240, 240, 240),
@@ -2267,7 +2732,9 @@ impl eframe::App for RedsailGuiApp {
                     }
                     let p_wbox_label = to_screen(wbox[0]);
                     let (wbox_offset, wbox_align) = match self.canvas_origin_corner {
-                        CanvasOriginCorner::BottomRight => (Vec2::new(-4.0, -4.0), egui::Align2::RIGHT_BOTTOM),
+                        CanvasOriginCorner::BottomLeft | CanvasOriginCorner::BottomRight => {
+                            (Vec2::new(4.0, -4.0), egui::Align2::LEFT_BOTTOM)
+                        }
                         CanvasOriginCorner::TopLeft => (Vec2::new(4.0, 4.0), egui::Align2::LEFT_TOP),
                     };
                     painter.text(
@@ -2281,6 +2748,10 @@ impl eframe::App for RedsailGuiApp {
 
                 // 4. Floating Legend Card
                 let legend_rect = match self.canvas_origin_corner {
+                    CanvasOriginCorner::BottomLeft => egui::Rect::from_min_size(
+                        canvas_rect.right_bottom() - Vec2::new(190.0, 98.0),
+                        Vec2::new(180.0, 62.0),
+                    ),
                     CanvasOriginCorner::BottomRight => egui::Rect::from_min_size(
                         canvas_rect.left_bottom() + Vec2::new(16.0, -98.0),
                         Vec2::new(180.0, 62.0),
@@ -2326,6 +2797,21 @@ impl eframe::App for RedsailGuiApp {
 
                 // Match ruler edges directly with the active origin corner
                 let (h_ruler_rect, v_ruler_rect, corner_rect) = match origin_corner {
+                    CanvasOriginCorner::BottomLeft => {
+                        let h = egui::Rect::from_min_max(
+                            Pos2::new(canvas_rect.min.x + ruler_th_w, canvas_rect.max.y - ruler_th_h),
+                            canvas_rect.max,
+                        );
+                        let v = egui::Rect::from_min_max(
+                            Pos2::new(canvas_rect.min.x, canvas_rect.min.y),
+                            Pos2::new(canvas_rect.min.x + ruler_th_w, canvas_rect.max.y - ruler_th_h),
+                        );
+                        let c = egui::Rect::from_min_max(
+                            Pos2::new(canvas_rect.min.x, canvas_rect.max.y - ruler_th_h),
+                            Pos2::new(canvas_rect.min.x + ruler_th_w, canvas_rect.max.y),
+                        );
+                        (h, v, c)
+                    }
                     CanvasOriginCorner::BottomRight => {
                         let h = egui::Rect::from_min_max(
                             Pos2::new(canvas_rect.min.x, canvas_rect.max.y - ruler_th_h),
@@ -2363,7 +2849,7 @@ impl eframe::App for RedsailGuiApp {
                 let ruler_border = Stroke::new(1.0_f32, Color32::from_rgb(45, 50, 68));
                 painter.rect_filled(h_ruler_rect, 0.0, ruler_bg);
                 match origin_corner {
-                    CanvasOriginCorner::BottomRight => {
+                    CanvasOriginCorner::BottomLeft | CanvasOriginCorner::BottomRight => {
                         painter.line_segment([h_ruler_rect.left_top(), h_ruler_rect.right_top()], ruler_border);
                     }
                     CanvasOriginCorner::TopLeft => {
@@ -2373,17 +2859,21 @@ impl eframe::App for RedsailGuiApp {
 
                 painter.rect_filled(v_ruler_rect, 0.0, ruler_bg);
                 match origin_corner {
+                    CanvasOriginCorner::BottomLeft | CanvasOriginCorner::TopLeft => {
+                        painter.line_segment([v_ruler_rect.right_top(), v_ruler_rect.right_bottom()], ruler_border);
+                    }
                     CanvasOriginCorner::BottomRight => {
                         painter.line_segment([v_ruler_rect.left_top(), v_ruler_rect.left_bottom()], ruler_border);
-                    }
-                    CanvasOriginCorner::TopLeft => {
-                        painter.line_segment([v_ruler_rect.right_top(), v_ruler_rect.right_bottom()], ruler_border);
                     }
                 }
 
                 // Corner junction badge
                 painter.rect_filled(corner_rect, 0.0, Color32::from_rgb(28, 31, 42));
                 match origin_corner {
+                    CanvasOriginCorner::BottomLeft => {
+                        painter.line_segment([corner_rect.left_top(), corner_rect.right_top()], ruler_border);
+                        painter.line_segment([corner_rect.right_top(), corner_rect.right_bottom()], ruler_border);
+                    }
                     CanvasOriginCorner::BottomRight => {
                         painter.line_segment([corner_rect.left_top(), corner_rect.right_top()], ruler_border);
                         painter.line_segment([corner_rect.left_top(), corner_rect.left_bottom()], ruler_border);
@@ -2405,7 +2895,7 @@ impl eframe::App for RedsailGuiApp {
                 let zero_guide_stroke = Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(239, 68, 68, 140));
                 if canvas_rect.x_range().contains(origin.x) {
                     let (y0, y1) = match origin_corner {
-                        CanvasOriginCorner::BottomRight => (origin.y, h_ruler_rect.min.y),
+                        CanvasOriginCorner::BottomLeft | CanvasOriginCorner::BottomRight => (origin.y, h_ruler_rect.min.y),
                         CanvasOriginCorner::TopLeft => (h_ruler_rect.max.y, origin.y),
                     };
                     if (y1 - y0).abs() > 3.0 {
@@ -2414,6 +2904,7 @@ impl eframe::App for RedsailGuiApp {
                 }
                 if canvas_rect.y_range().contains(origin.y) {
                     let (x0, x1) = match origin_corner {
+                        CanvasOriginCorner::BottomLeft => (v_ruler_rect.max.x, origin.x),
                         CanvasOriginCorner::BottomRight => (origin.x, v_ruler_rect.min.x),
                         CanvasOriginCorner::TopLeft => (v_ruler_rect.max.x, origin.x),
                     };
@@ -2438,12 +2929,12 @@ impl eframe::App for RedsailGuiApp {
                 // 1. Horizontal Ruler Graduations (Width / Carriage)
                 if effective_zoom > 0.001 && h_ruler_rect.width() > 10.0 {
                     let h_raw_a = match origin_corner {
+                        CanvasOriginCorner::BottomLeft | CanvasOriginCorner::TopLeft => ((h_ruler_rect.min.x - origin.x) / effective_zoom) as f64,
                         CanvasOriginCorner::BottomRight => ((origin.x - h_ruler_rect.max.x) / effective_zoom) as f64,
-                        CanvasOriginCorner::TopLeft => ((h_ruler_rect.min.x - origin.x) / effective_zoom) as f64,
                     };
                     let h_raw_b = match origin_corner {
+                        CanvasOriginCorner::BottomLeft | CanvasOriginCorner::TopLeft => ((h_ruler_rect.max.x - origin.x) / effective_zoom) as f64,
                         CanvasOriginCorner::BottomRight => ((origin.x - h_ruler_rect.min.x) / effective_zoom) as f64,
-                        CanvasOriginCorner::TopLeft => ((h_ruler_rect.max.x - origin.x) / effective_zoom) as f64,
                     };
                     if h_raw_a.is_finite() && h_raw_b.is_finite() {
                         let (h_min_mm, h_max_mm) = if h_raw_a < h_raw_b { (h_raw_a, h_raw_b) } else { (h_raw_b, h_raw_a) };
@@ -2456,8 +2947,8 @@ impl eframe::App for RedsailGuiApp {
                         for idx in h_start_idx..=clamped_end {
                             let val_mm = (idx as f64) * eff_step;
                             let screen_x = match origin_corner {
+                                CanvasOriginCorner::BottomLeft | CanvasOriginCorner::TopLeft => origin.x + (val_mm as f32 * effective_zoom),
                                 CanvasOriginCorner::BottomRight => origin.x - (val_mm as f32 * effective_zoom),
-                                CanvasOriginCorner::TopLeft => origin.x + (val_mm as f32 * effective_zoom),
                             };
 
                             if screen_x >= h_ruler_rect.min.x && screen_x <= h_ruler_rect.max.x {
@@ -2473,7 +2964,7 @@ impl eframe::App for RedsailGuiApp {
                                 };
 
                                 let (p_base, p_tip) = match origin_corner {
-                                    CanvasOriginCorner::BottomRight => (
+                                    CanvasOriginCorner::BottomLeft | CanvasOriginCorner::BottomRight => (
                                         Pos2::new(screen_x, h_ruler_rect.min.y),
                                         Pos2::new(screen_x, h_ruler_rect.min.y + tick_len),
                                     ),
@@ -2487,6 +2978,10 @@ impl eframe::App for RedsailGuiApp {
                                 if is_major {
                                     let label = format!("{:.0}", val_mm);
                                     let (label_pos, align) = match origin_corner {
+                                        CanvasOriginCorner::BottomLeft => (
+                                            Pos2::new(screen_x + 2.0, h_ruler_rect.max.y - 2.0),
+                                            egui::Align2::LEFT_BOTTOM,
+                                        ),
                                         CanvasOriginCorner::BottomRight => (
                                             Pos2::new(screen_x - 2.0, h_ruler_rect.max.y - 2.0),
                                             egui::Align2::RIGHT_BOTTOM,
@@ -2502,7 +2997,7 @@ impl eframe::App for RedsailGuiApp {
                                         label,
                                         egui::FontId::monospace(9.0),
                                         if val_mm.abs() < 0.001 {
-                                            Color32::from_rgb(239, 68, 68)
+                                             Color32::from_rgb(239, 68, 68)
                                         } else {
                                             Color32::from_rgb(170, 185, 210)
                                         },
@@ -2516,11 +3011,11 @@ impl eframe::App for RedsailGuiApp {
                 // 2. Vertical Ruler Graduations (Length / Feed)
                 if effective_zoom > 0.001 && v_ruler_rect.height() > 10.0 {
                     let v_raw_a = match origin_corner {
-                        CanvasOriginCorner::BottomRight => ((origin.y - v_ruler_rect.max.y) / effective_zoom) as f64,
+                        CanvasOriginCorner::BottomLeft | CanvasOriginCorner::BottomRight => ((origin.y - v_ruler_rect.max.y) / effective_zoom) as f64,
                         CanvasOriginCorner::TopLeft => ((v_ruler_rect.min.y - origin.y) / effective_zoom) as f64,
                     };
                     let v_raw_b = match origin_corner {
-                        CanvasOriginCorner::BottomRight => ((origin.y - v_ruler_rect.min.y) / effective_zoom) as f64,
+                        CanvasOriginCorner::BottomLeft | CanvasOriginCorner::BottomRight => ((origin.y - v_ruler_rect.min.y) / effective_zoom) as f64,
                         CanvasOriginCorner::TopLeft => ((v_ruler_rect.max.y - origin.y) / effective_zoom) as f64,
                     };
                     if v_raw_a.is_finite() && v_raw_b.is_finite() {
@@ -2534,7 +3029,7 @@ impl eframe::App for RedsailGuiApp {
                         for idx in v_start_idx..=clamped_end {
                             let val_mm = (idx as f64) * eff_step;
                             let screen_y = match origin_corner {
-                                CanvasOriginCorner::BottomRight => origin.y - (val_mm as f32 * effective_zoom),
+                                CanvasOriginCorner::BottomLeft | CanvasOriginCorner::BottomRight => origin.y - (val_mm as f32 * effective_zoom),
                                 CanvasOriginCorner::TopLeft => origin.y + (val_mm as f32 * effective_zoom),
                             };
 
@@ -2551,13 +3046,13 @@ impl eframe::App for RedsailGuiApp {
                                 };
 
                                 let (p_base, p_tip) = match origin_corner {
+                                    CanvasOriginCorner::BottomLeft | CanvasOriginCorner::TopLeft => (
+                                        Pos2::new(v_ruler_rect.max.x, screen_y),
+                                        Pos2::new(v_ruler_rect.max.x - tick_len, screen_y),
+                                    ),
                                     CanvasOriginCorner::BottomRight => (
                                         Pos2::new(v_ruler_rect.min.x, screen_y),
                                         Pos2::new(v_ruler_rect.min.x + tick_len, screen_y),
-                                    ),
-                                    CanvasOriginCorner::TopLeft => (
-                                        Pos2::new(v_ruler_rect.max.x, screen_y),
-                                        Pos2::new(v_ruler_rect.max.x - tick_len, screen_y),
                                     ),
                                 };
                                 painter.line_segment([p_base, p_tip], stroke);
@@ -2565,13 +3060,13 @@ impl eframe::App for RedsailGuiApp {
                                 if is_major {
                                     let label = format!("{:.0}", val_mm);
                                     let (label_pos, align) = match origin_corner {
+                                        CanvasOriginCorner::BottomLeft | CanvasOriginCorner::TopLeft => (
+                                            Pos2::new(v_ruler_rect.min.x + 2.0, screen_y - 2.0),
+                                            egui::Align2::LEFT_BOTTOM,
+                                        ),
                                         CanvasOriginCorner::BottomRight => (
                                             Pos2::new(v_ruler_rect.max.x - 2.0, screen_y - 2.0),
                                             egui::Align2::RIGHT_BOTTOM,
-                                        ),
-                                        CanvasOriginCorner::TopLeft => (
-                                            Pos2::new(v_ruler_rect.min.x + 2.0, screen_y - 2.0),
-                                            egui::Align2::LEFT_BOTTOM,
                                         ),
                                     };
                                     painter.text(
@@ -2592,14 +3087,15 @@ impl eframe::App for RedsailGuiApp {
                 }
 
                 // 3. Mouse Cursor Tracking on Rulers
-                if let Some(hover_pos) = ctx.input(|i| i.pointer.hover_pos()) {
-                    if canvas_rect.contains(hover_pos) {
-                        let cursor_x_mm = match origin_corner {
+                if let Some(hover_pos) = ctx.input(|i| i.pointer.hover_pos())
+                    && canvas_rect.contains(hover_pos)
+                {
+                    let cursor_x_mm = match origin_corner {
+                            CanvasOriginCorner::BottomLeft | CanvasOriginCorner::TopLeft => (hover_pos.x - origin.x) / effective_zoom,
                             CanvasOriginCorner::BottomRight => (origin.x - hover_pos.x) / effective_zoom,
-                            CanvasOriginCorner::TopLeft => (hover_pos.x - origin.x) / effective_zoom,
                         };
                         let cursor_y_mm = match origin_corner {
-                            CanvasOriginCorner::BottomRight => (origin.y - hover_pos.y) / effective_zoom,
+                            CanvasOriginCorner::BottomLeft | CanvasOriginCorner::BottomRight => (origin.y - hover_pos.y) / effective_zoom,
                             CanvasOriginCorner::TopLeft => (hover_pos.y - origin.y) / effective_zoom,
                         };
 
@@ -2621,6 +3117,10 @@ impl eframe::App for RedsailGuiApp {
 
                         // Floating cursor coordinate pill (placed in opposite corner from rulers)
                         let pill_rect = match origin_corner {
+                            CanvasOriginCorner::BottomLeft => egui::Rect::from_min_size(
+                                Pos2::new(canvas_rect.max.x - 157.0, canvas_rect.min.y + 12.0),
+                                Vec2::new(145.0, 20.0),
+                            ),
                             CanvasOriginCorner::BottomRight => egui::Rect::from_min_size(
                                 Pos2::new(canvas_rect.min.x + 12.0, canvas_rect.min.y + 12.0),
                                 Vec2::new(145.0, 20.0),
@@ -2645,7 +3145,6 @@ impl eframe::App for RedsailGuiApp {
                             Color32::from_rgb(200, 225, 255),
                         );
                     }
-                }
             }
         });
     }

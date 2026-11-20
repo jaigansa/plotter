@@ -1,4 +1,5 @@
 mod blade_offset;
+mod cut_validation;
 mod device;
 mod gui;
 mod hpgl;
@@ -83,6 +84,14 @@ enum Commands {
         #[arg(long, default_value_t = 5.0)]
         weeding_margin: f64,
 
+        /// Maximum cut width in mm (default 600). Cut wider than this is rejected.
+        #[arg(long, default_value_t = 600.0)]
+        max_cut_width: f64,
+
+        /// Minimum cut feature in mm (default 0.5 = 2 x blade offset). Segments smaller are rejected.
+        #[arg(long, default_value_t = 0.5)]
+        min_feature: f64,
+
         /// Simulate the job without sending commands to hardware
         #[arg(long)]
         dry_run: bool,
@@ -137,6 +146,14 @@ enum Commands {
         /// Margin around artwork for the weeding box in mm
         #[arg(long, default_value_t = 5.0)]
         weeding_margin: f64,
+
+        /// Maximum cut width in mm (default 600). Cut wider than this is rejected.
+        #[arg(long, default_value_t = 600.0)]
+        max_cut_width: f64,
+
+        /// Minimum cut feature in mm (default 0.5 = 2 x blade offset). Segments smaller are rejected.
+        #[arg(long, default_value_t = 0.5)]
+        min_feature: f64,
     },
 
     /// Send a pre-generated HP-GL file directly to the plotter
@@ -199,8 +216,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             swap_xy,
             weeding_box,
             weeding_margin,
+            max_cut_width,
+            min_feature,
         }) => {
             println!("Reading SVG: {}", input.display());
+            if !input.is_file() {
+                return Err(format!("Input file not found or is not a regular file: {}", input.display()).into());
+            }
             let svg_content = fs::read_to_string(&input)?;
             let hpgl_data = generate_hpgl(
                 &svg_content,
@@ -212,6 +234,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 normalize_origin,
                 flip_y,
                 swap_xy,
+                max_cut_width,
+                min_feature,
                 weeding_box,
                 weeding_margin,
             )?;
@@ -234,9 +258,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             swap_xy,
             weeding_box,
             weeding_margin,
+            max_cut_width,
+            min_feature,
             dry_run,
         }) => {
             println!("Reading SVG: {}", input.display());
+            if !input.is_file() {
+                return Err(format!("Input file not found or is not a regular file: {}", input.display()).into());
+            }
             let svg_content = fs::read_to_string(&input)?;
             let hpgl_data = generate_hpgl(
                 &svg_content,
@@ -248,6 +277,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 normalize_origin,
                 flip_y,
                 swap_xy,
+                max_cut_width,
+                min_feature,
                 weeding_box,
                 weeding_margin,
             )?;
@@ -294,6 +325,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Some(Commands::Send { input, port, baud }) => {
             println!("Reading HP-GL file: {}", input.display());
+            if !input.is_file() {
+                return Err(format!("Input file not found or is not a regular file: {}", input.display()).into());
+            }
             let hpgl_data = fs::read_to_string(&input)?;
 
             println!("Connecting to {} at {} baud (Paced Flow Control)...", port, baud);
@@ -319,6 +353,8 @@ fn generate_hpgl(
     normalize_origin: bool,
     flip_y: bool,
     swap_xy: bool,
+    max_cut_width: f64,
+    min_feature: f64,
     weeding_box: bool,
     weeding_margin: f64,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -393,6 +429,38 @@ fn generate_hpgl(
         transformed.push(pts);
     }
 
+    // Impossible-cut prevention: validate plotter max width and min feature size.
+    // Feed length is unlimited (no max_cut_length check).
+    let limits = cut_validation::CutLimits {
+        max_cut_width_mm: Some(max_cut_width),
+        max_cut_length_mm: None,
+        min_feature_mm: min_feature,
+    };
+
+    // Build weeding box for validation (mirrors what will be cut below)
+    let weeding_box_for_validation = if weeding_box && !transformed.is_empty() {
+        let wm = weeding_margin * scale;
+        let bx0 = (t_min_x - wm).max(0.0);
+        let by0 = (t_min_y - wm).max(0.0);
+        let bx1 = t_max_x + wm;
+        let by1 = t_max_y + wm;
+        Some(vec![
+            kurbo::Point::new(bx0, by0),
+            kurbo::Point::new(bx1, by0),
+            kurbo::Point::new(bx1, by1),
+            kurbo::Point::new(bx0, by1),
+            kurbo::Point::new(bx0, by0),
+        ])
+    } else {
+        None
+    };
+
+    if let Some(wbox) = &weeding_box_for_validation {
+        cut_validation::validate_cut_limits(&transformed, Some(wbox), &limits)?;
+    } else {
+        cut_validation::validate_cut_limits(&transformed, None, &limits)?;
+    }
+
     let settings = CutterSettings {
         speed,
         force,
@@ -412,10 +480,11 @@ fn generate_hpgl(
 
         total_points += compensated.len();
         let start = compensated[0];
-        builder.pen_up(mm_to_plotter(start.x), mm_to_plotter(start.y));
+        // Plotter X/Y swapped: HP-GL PU{x},{y} where x=feed, y=carriage
+        builder.pen_up(mm_to_plotter(start.y), mm_to_plotter(start.x));
 
         for pt in &compensated[1..] {
-            builder.pen_down(mm_to_plotter(pt.x), mm_to_plotter(pt.y));
+            builder.pen_down(mm_to_plotter(pt.y), mm_to_plotter(pt.x));
         }
         builder.pen_up_in_place();
     }
@@ -439,10 +508,10 @@ fn generate_hpgl(
         if !compensated_box.is_empty() {
             total_points += compensated_box.len();
             let start = compensated_box[0];
-            builder.pen_up(mm_to_plotter(start.x), mm_to_plotter(start.y));
+            builder.pen_up(mm_to_plotter(start.y), mm_to_plotter(start.x));
 
             for pt in &compensated_box[1..] {
-                builder.pen_down(mm_to_plotter(pt.x), mm_to_plotter(pt.y));
+                builder.pen_down(mm_to_plotter(pt.y), mm_to_plotter(pt.x));
             }
             builder.pen_up_in_place();
         }

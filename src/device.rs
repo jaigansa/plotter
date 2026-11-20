@@ -144,10 +144,15 @@ impl RedsailDevice {
                         let dist = (target_x - last_x).hypot(target_y - last_y);
                         last_x = target_x;
                         last_y = target_y;
-                        // Safe cutting motion pacing accounting for stepper inertia:
+                        // Cutting motion pacing accounting for stepper inertia.
+                        // Short segments need less dwell — long minimum delays cause
+                        // the cutter to stop-start on every tiny curve segment, vibrating.
                         let eff_speed = current_speed_mms.min(75.0);
                         let move_ms = ((dist / eff_speed) * 1000.0).round() as u64;
-                        Duration::from_millis(move_ms.max(35) + 30)
+                        // Minimum dwell scales with distance: tiny moves need almost no wait,
+                        // long moves need full acceleration dwell.
+                        let min_dwell = if dist < 1.0 { 15 } else if dist < 3.0 { 25 } else { 35 };
+                        Duration::from_millis(move_ms.max(min_dwell) + 30)
                     } else {
                         Duration::from_millis(45)
                     }

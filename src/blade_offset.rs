@@ -35,6 +35,12 @@ impl BladeCompensator {
             let len = (dx * dx + dy * dy).sqrt();
 
             if len < 1e-6 {
+                // Near-duplicate point: still record it so the path isn't broken,
+                // but skip corner compensation for this degenerate segment.
+                if compensated.is_empty() {
+                    compensated.push(p0);
+                }
+                compensated.push(p1);
                 continue;
             }
 
