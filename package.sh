@@ -36,8 +36,6 @@ install -m 644 "${PROJECT_ROOT}/assets/redsail-cutter.svg" "${STAGE_DIR}/assets/
 install -m 644 "${PROJECT_ROOT}/assets/99-redsail.rules" "${STAGE_DIR}/assets/"
 
 install -m 644 "${PROJECT_ROOT}/README.md" "${STAGE_DIR}/"
-install -m 644 "${PROJECT_ROOT}/axis_test.svg" "${STAGE_DIR}/"
-install -m 644 "${PROJECT_ROOT}/test_cut.svg" "${STAGE_DIR}/"
 
 cat << 'EOF' > "${STAGE_DIR}/install.sh"
 #!/usr/bin/env bash

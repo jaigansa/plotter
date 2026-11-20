@@ -174,14 +174,14 @@ impl RedsailDevice {
 }
 
 /// Information about a detected serial or USB port
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetectedPort {
     pub name: String,
     pub description: String,
     pub is_likely_cutter: bool,
 }
 
-/// Enumerate all available serial ports on the system
+/// Enumerate all available serial ports on the system (deduplicated and prioritized)
 pub fn list_ports() -> Vec<DetectedPort> {
     let mut results = Vec::new();
     if let Ok(ports) = serialport::available_ports() {
@@ -201,12 +201,23 @@ pub fn list_ports() -> Vec<DetectedPort> {
                 SerialPortType::Unknown => ("Standard Serial Port".to_string(), false),
             };
 
-            results.push(DetectedPort {
-                name: p.port_name,
-                description: desc,
-                is_likely_cutter: likely,
-            });
+            // Deduplicate by port_name to avoid repeated device entries
+            if !results.iter().any(|existing: &DetectedPort| existing.name == p.port_name) {
+                results.push(DetectedPort {
+                    name: p.port_name,
+                    description: desc,
+                    is_likely_cutter: likely,
+                });
+            }
         }
     }
+
+    // Sort so likely cutters appear first, followed alphabetically by device name
+    results.sort_by(|a, b| {
+        b.is_likely_cutter
+            .cmp(&a.is_likely_cutter)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
     results
 }

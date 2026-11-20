@@ -56,8 +56,42 @@ impl MaterialPreset {
     }
 }
 
-const EMBEDDED_TEST_CUT_SVG: &str = include_str!("../test_cut.svg");
-const EMBEDDED_AXIS_TEST_SVG: &str = include_str!("../axis_test.svg");
+const EMBEDDED_TEST_CUT_SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 30 30" width="30mm" height="30mm">
+  <!-- Outer calibration square (20mm x 20mm) -->
+  <rect x="5" y="5" width="20" height="20" fill="none" stroke="black" stroke-width="0.5"/>
+  <!-- Inner calibration circle (14mm diameter) -->
+  <circle cx="15" cy="15" r="7" fill="none" stroke="black" stroke-width="0.5"/>
+</svg>"#;
+
+const EMBEDDED_AXIS_TEST_SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="75mm" height="50mm" viewBox="0 0 75 50">
+  <!-- Origin crosshair at (5, 5) -->
+  <line x1="2" y1="5" x2="8" y2="5" stroke="black" stroke-width="0.5"/>
+  <line x1="5" y1="2" x2="5" y2="8" stroke="black" stroke-width="0.5"/>
+
+  <!-- X Axis (Longer: 50mm, from 5 to 55) -->
+  <line x1="5" y1="5" x2="55" y2="5" stroke="black" stroke-width="0.5"/>
+  <!-- X Arrowhead -->
+  <polyline points="50,8 55,5 50,2" fill="none" stroke="black" stroke-width="0.5"/>
+  <!-- Letter X -->
+  <line x1="57" y1="2" x2="63" y2="8" stroke="black" stroke-width="0.5"/>
+  <line x1="57" y1="8" x2="63" y2="2" stroke="black" stroke-width="0.5"/>
+
+  <!-- Y Axis (Shorter: 30mm, from 5 to 35) -->
+  <line x1="5" y1="5" x2="5" y2="35" stroke="black" stroke-width="0.5"/>
+  <!-- Y Arrowhead -->
+  <polyline points="2,30 5,35 8,30" fill="none" stroke="black" stroke-width="0.5"/>
+  <!-- Letter Y -->
+  <polyline points="2,42 5,38 8,42" fill="none" stroke="black" stroke-width="0.5"/>
+  <line x1="5" y1="38" x2="5" y2="34" stroke="black" stroke-width="0.5"/>
+
+  <!-- Asymmetric orientation test glyph: Letter F -->
+  <line x1="20" y1="12" x2="20" y2="26" stroke="black" stroke-width="0.5"/>
+  <line x1="20" y1="26" x2="29" y2="26" stroke="black" stroke-width="0.5"/>
+  <line x1="20" y1="19" x2="26" y2="19" stroke="black" stroke-width="0.5"/>
+
+  <!-- 10mm calibration reference square -->
+  <rect x="35" y="12" width="10" height="10" fill="none" stroke="black" stroke-width="0.5"/>
+</svg>"#;
 
 #[derive(Default, Clone)]
 pub struct TransformedOutput {
@@ -372,16 +406,19 @@ pub struct RedsailGuiApp {
     canvas_pan: Vec2,
 }
 
+fn find_preferred_port(ports: &[DetectedPort]) -> String {
+    ports
+        .iter()
+        .find(|p| p.is_likely_cutter)
+        .or_else(|| ports.first())
+        .map(|p| p.name.clone())
+        .unwrap_or_default()
+}
+
 impl Default for RedsailGuiApp {
     fn default() -> Self {
         let ports = list_ports();
-        let selected_port = ports
-            .iter()
-            .find(|p| p.is_likely_cutter)
-            .map(|p| p.name.clone())
-            .unwrap_or_else(|| {
-                ports.first().map(|p| p.name.clone()).unwrap_or_default()
-            });
+        let selected_port = find_preferred_port(&ports);
 
         let baud = 9600;
         let flow_mode = FlowControlMode::None;
@@ -401,7 +438,7 @@ impl Default for RedsailGuiApp {
         );
 
         let mut app = Self {
-            svg_path_input: "test_cut.svg".to_string(),
+            svg_path_input: String::new(),
             loaded_docs: Vec::new(),
             file_picker_tx,
             file_picker_rx,
@@ -487,12 +524,7 @@ impl RedsailGuiApp {
     fn refresh_ports(&mut self) {
         self.ports = list_ports();
         if !self.ports.iter().any(|p| p.name == self.selected_port) {
-            self.selected_port = self
-                .ports
-                .iter()
-                .find(|p| p.is_likely_cutter)
-                .map(|p| p.name.clone())
-                .unwrap_or_default();
+            self.selected_port = find_preferred_port(&self.ports);
         }
         self.notify_port_config_changed();
         self.log(format!("Refreshed ports: found {} device(s).", self.ports.len()));
@@ -623,15 +655,19 @@ impl RedsailGuiApp {
     }
 
     fn load_svg(&mut self) {
-        let path = PathBuf::from(&self.svg_path_input);
+        let input = self.svg_path_input.trim();
+        if input.is_empty() {
+            return;
+        }
+        let path = PathBuf::from(input);
         if path.exists() {
             self.add_svg_from_path(&path);
-        } else if self.svg_path_input == "test_cut.svg" || self.svg_path_input.is_empty() {
+        } else if input == "test_cut.svg" {
             self.add_svg_content(EMBEDDED_TEST_CUT_SVG, "test_cut.svg", None);
-        } else if self.svg_path_input == "axis_test.svg" {
+        } else if input == "axis_test.svg" {
             self.add_svg_content(EMBEDDED_AXIS_TEST_SVG, "axis_test.svg", None);
         } else {
-            self.log(format!("File does not exist: {}", self.svg_path_input));
+            self.log(format!("File does not exist: {}", input));
         }
     }
 
@@ -813,6 +849,102 @@ impl RedsailGuiApp {
         self.add_svg_content(EMBEDDED_TEST_CUT_SVG, "test_cut.svg", None);
         self.log("Cutting Test Pattern (with blade compensation & safe background streaming)...".to_string());
         self.execute_cut(false);
+    }
+
+    fn execute_test_box(&mut self) {
+        if self.is_cutting {
+            self.log("[Warning] A cut job or test is already in progress.".to_string());
+            return;
+        }
+
+        if self.selected_port.is_empty() {
+            self.log("[Error] No serial port selected!".to_string());
+            return;
+        }
+
+        let output = self.transform_paths();
+        if output.active_paths.is_empty() {
+            self.log("[Warning] No active vector paths to trace. Please check at least one layer in Artwork & Layers.".to_string());
+            return;
+        }
+
+        // Determine outer bounding rectangle in cut coordinates
+        let (min_x, min_y, max_x, max_y) = if let Some(wbox) = &output.weeding_box {
+            let mut bx0 = f64::MAX;
+            let mut by0 = f64::MAX;
+            let mut bx1 = f64::MIN;
+            let mut by1 = f64::MIN;
+            for pt in wbox {
+                if pt.x < bx0 { bx0 = pt.x; }
+                if pt.x > bx1 { bx1 = pt.x; }
+                if pt.y < by0 { by0 = pt.y; }
+                if pt.y > by1 { by1 = pt.y; }
+            }
+            (bx0, by0, bx1, by1)
+        } else {
+            let mut mx0 = f64::MAX;
+            let mut my0 = f64::MAX;
+            let mut mx1 = f64::MIN;
+            let mut my1 = f64::MIN;
+            for path in &output.active_paths {
+                for pt in path {
+                    if pt.x < mx0 { mx0 = pt.x; }
+                    if pt.x > mx1 { mx1 = pt.x; }
+                    if pt.y < my0 { my0 = pt.y; }
+                    if pt.y > my1 { my1 = pt.y; }
+                }
+            }
+            (mx0, my0, mx1, my1)
+        };
+
+        if min_x > max_x || min_y > max_y {
+            self.log("[Warning] Invalid geometry bounds for Test Box.".to_string());
+            return;
+        }
+
+        let width_mm = max_x - min_x;
+        let height_mm = max_y - min_y;
+
+        self.log(format!(
+            "Tracing Test Box ({:.1} mm x {:.1} mm) from ({:.1}, {:.1}) to ({:.1}, {:.1}) with blade lifted (PU)...",
+            width_mm, height_mm, min_x, min_y, max_x, max_y
+        ));
+
+        let settings = CutterSettings {
+            speed: self.speed,
+            force: self.force,
+            blade_offset_mm: 0.0,
+        };
+
+        let mut builder = HpglBuilder::new(&settings);
+        builder.pen_up_in_place();
+
+        // Trace the four corners with Pen Up (PU)
+        let p0_x = mm_to_plotter(min_x);
+        let p0_y = mm_to_plotter(min_y);
+        let p1_x = mm_to_plotter(max_x);
+        let p1_y = mm_to_plotter(min_y);
+        let p2_x = mm_to_plotter(max_x);
+        let p2_y = mm_to_plotter(max_y);
+        let p3_x = mm_to_plotter(min_x);
+        let p3_y = mm_to_plotter(max_y);
+
+        builder.pen_up(p0_x, p0_y);
+        builder.pen_up(p1_x, p1_y);
+        builder.pen_up(p2_x, p2_y);
+        builder.pen_up(p3_x, p3_y);
+        builder.pen_up(p0_x, p0_y);
+
+        let hpgl = builder.finish();
+
+        self.cut_progress_bytes = 0;
+        self.cut_total_bytes = hpgl.len();
+        self.is_cutting = true;
+
+        let _ = self.cmd_tx.send(SerialCommand::ExecuteHpgl {
+            hpgl,
+            total_pts: 5,
+        });
     }
 
     fn execute_axis_test_pattern(&mut self) {
@@ -1018,57 +1150,7 @@ impl eframe::App for RedsailGuiApp {
                     // Logo and Title
                     ui.label(egui::RichText::new("PLOTTER").strong().size(16.0).color(Color32::from_rgb(0, 210, 255)));
                     ui.label(egui::RichText::new("Controller").size(15.0).color(Color32::from_rgb(180, 190, 210)));
-                    ui.label(egui::RichText::new("v0.1.0").monospace().size(11.0).color(Color32::DARK_GRAY));
-
-                    ui.add_space(16.0);
-                    ui.separator();
-                    ui.add_space(16.0);
-
-                    // Connection Status Pill
-                    let has_cutter = self.ports.iter().any(|p| p.name == self.selected_port && p.is_likely_cutter);
-                    let has_port = !self.selected_port.is_empty();
-
-                    let (pill_bg, dot_color, status_text) = if has_cutter {
-                        (Color32::from_rgb(16, 42, 30), Color32::from_rgb(34, 197, 94), format!("Cutter Ready: {}", self.selected_port))
-                    } else if has_port {
-                        (Color32::from_rgb(44, 36, 20), Color32::from_rgb(234, 179, 8), format!("Port: {}", self.selected_port))
-                    } else {
-                        (Color32::from_rgb(34, 36, 44), Color32::from_rgb(148, 163, 184), "Offline / No Port".to_string())
-                    };
-
-                    egui::Frame::NONE
-                        .fill(pill_bg)
-                        .corner_radius(egui::CornerRadius::same(12))
-                        .inner_margin(egui::Margin::symmetric(10, 4))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.colored_label(dot_color, icons::PLUG);
-                                ui.label(egui::RichText::new(status_text).size(11.5).strong().color(Color32::WHITE));
-                            });
-                        });
-
-                    // Port Dropdown right in header
-                    ui.add_space(6.0);
-                    let old_port = self.selected_port.clone();
-                    egui::ComboBox::from_id_salt("header_port_select")
-                        .selected_text(if self.selected_port.is_empty() { "Select Port".to_string() } else { self.selected_port.clone() })
-                        .show_ui(ui, |ui| {
-                            for p in &self.ports {
-                                let label = if p.is_likely_cutter {
-                                    format!("{} (Cutter)", p.name)
-                                } else {
-                                    p.name.clone()
-                                };
-                                ui.selectable_value(&mut self.selected_port, p.name.clone(), label);
-                            }
-                        });
-                    if self.selected_port != old_port {
-                        self.notify_port_config_changed();
-                    }
-
-                    if ui.small_button(icons::ARROW_CLOCKWISE).on_hover_text("Refresh Serial Ports").clicked() {
-                        self.refresh_ports();
-                    }
+                    ui.label(egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).monospace().size(11.0).color(Color32::DARK_GRAY));
 
                     // Right-aligned header controls
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1180,12 +1262,16 @@ impl eframe::App for RedsailGuiApp {
                     });
 
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Presets:").size(11.0).color(Color32::GRAY));
-                        if ui.small_button("+ Test Cut").on_hover_text("Add embedded calibration pattern").clicked() {
-                            self.add_svg_content(EMBEDDED_TEST_CUT_SVG, "test_cut.svg", None);
-                        }
-                        if ui.small_button("+ Axis Test").on_hover_text("Add embedded axis alignment pattern").clicked() {
-                            self.add_svg_content(EMBEDDED_AXIS_TEST_SVG, "axis_test.svg", None);
+                        if self.developer_mode {
+                            ui.label(egui::RichText::new("Presets:").size(11.0).color(Color32::GRAY));
+                            if ui.small_button("+ Test Cut").on_hover_text("Add embedded calibration pattern").clicked() {
+                                self.add_svg_content(EMBEDDED_TEST_CUT_SVG, "test_cut.svg", None);
+                            }
+                            if ui.small_button("+ Axis Test").on_hover_text("Add embedded axis alignment pattern").clicked() {
+                                self.add_svg_content(EMBEDDED_AXIS_TEST_SVG, "axis_test.svg", None);
+                            }
+                        } else {
+                            ui.label(egui::RichText::new("Select:").size(11.0).color(Color32::GRAY));
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("Invert").on_hover_text("Invert selection").clicked() {
@@ -1445,12 +1531,31 @@ impl eframe::App for RedsailGuiApp {
                     ui.add_space(4.0);
 
                     ui.horizontal(|ui| {
-                        let btn_w = (ui.available_width() - 8.0) / 2.0;
-                        if ui.add_sized([btn_w, 28.0], egui::Button::new(format!("{} Dry Run", icons::EYE))).on_hover_text("Simulate cut trajectory without sending to hardware").clicked() {
+                        let count = if self.developer_mode { 3.0 } else { 2.0 };
+                        let spacing = (count - 1.0) * 6.0;
+                        let btn_w = ((ui.available_width() - spacing) / count).max(40.0);
+
+                        if ui.add_sized([btn_w, 28.0], egui::Button::new(format!("{} Dry Run", icons::EYE)))
+                            .on_hover_text("Simulate cut trajectory without sending to hardware")
+                            .clicked()
+                        {
                             self.execute_cut(true);
                         }
-                        if ui.add_sized([btn_w, 28.0], egui::Button::new(format!("{} Test Cut", icons::SCISSORS))).on_hover_text("Cut small 12mm test square & triangle").clicked() {
-                            self.execute_test_pattern();
+
+                        if ui.add_sized([btn_w, 28.0], egui::Button::new(format!("{} Test Box", icons::SQUARE)))
+                            .on_hover_text("Trace outer rectangle (min_x, min_y to max_x, max_y) with blade lifted (PU) to visually verify roll width, length, and pinch rollers without cutting")
+                            .clicked()
+                        {
+                            self.execute_test_box();
+                        }
+
+                        if self.developer_mode {
+                            if ui.add_sized([btn_w, 28.0], egui::Button::new(format!("{} Test Cut", icons::SCISSORS)))
+                                .on_hover_text("Cut small calibration pattern (square & circle)")
+                                .clicked()
+                            {
+                                self.execute_test_pattern();
+                            }
                         }
                     });
 
@@ -1479,28 +1584,68 @@ impl eframe::App for RedsailGuiApp {
                     ui.label(egui::RichText::new("Machine Workstation").heading().size(15.0));
                     ui.add_space(4.0);
 
-                    // --- 1. Serial Port & Communication ---
+                    // --- 1. Serial Connection ---
                     ui.group(|ui| {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("Serial Connection").strong().size(12.0));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button(icons::ARROW_CLOCKWISE).on_hover_text("Refresh Ports").clicked() {
+                                if ui.small_button(icons::ARROW_CLOCKWISE).on_hover_text("Refresh Serial Devices").clicked() {
                                     self.refresh_ports();
                                 }
                             });
                         });
 
+                        ui.add_space(2.0);
+
+                        // Connection Status Pill
+                        let has_cutter = self.ports.iter().any(|p| p.name == self.selected_port && p.is_likely_cutter);
+                        let has_port = !self.selected_port.is_empty();
+
+                        let (pill_bg, dot_color, status_text) = if has_cutter {
+                            (Color32::from_rgb(16, 42, 30), Color32::from_rgb(34, 197, 94), "Cutter Ready")
+                        } else if has_port {
+                            (Color32::from_rgb(44, 36, 20), Color32::from_rgb(234, 179, 8), "Connected")
+                        } else {
+                            (Color32::from_rgb(34, 36, 44), Color32::from_rgb(148, 163, 184), "Offline / No Device")
+                        };
+
+                        egui::Frame::NONE
+                            .fill(pill_bg)
+                            .corner_radius(egui::CornerRadius::same(6))
+                            .inner_margin(egui::Margin::symmetric(8, 4))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.colored_label(dot_color, icons::PLUG);
+                                    ui.label(egui::RichText::new(status_text).size(11.0).strong().color(Color32::WHITE));
+                                });
+                            });
+
+                        ui.add_space(3.0);
+
                         let old_port = self.selected_port.clone();
+                        let selected_label = if self.selected_port.is_empty() {
+                            "Select Device...".to_string()
+                        } else {
+                            self.selected_port.clone()
+                        };
                         egui::ComboBox::from_id_salt("right_panel_port_combo")
-                            .selected_text(if self.selected_port.is_empty() { "None".to_string() } else { self.selected_port.clone() })
+                            .selected_text(selected_label)
+                            .width(ui.available_width() - 8.0)
                             .show_ui(ui, |ui| {
-                                for p in &self.ports {
-                                    let label = if p.is_likely_cutter {
-                                        format!("{} (Cutter)", p.name)
-                                    } else {
-                                        p.name.clone()
-                                    };
-                                    ui.selectable_value(&mut self.selected_port, p.name.clone(), label);
+                                if self.ports.is_empty() {
+                                    ui.label(egui::RichText::new("No serial devices detected").italics().color(Color32::GRAY));
+                                } else {
+                                    for p in &self.ports {
+                                        let label = if p.is_likely_cutter {
+                                            format!("{} (Cutter)", p.name)
+                                        } else {
+                                            p.name.clone()
+                                        };
+                                        let resp = ui.selectable_value(&mut self.selected_port, p.name.clone(), label);
+                                        if !p.description.is_empty() {
+                                            resp.on_hover_text(&p.description);
+                                        }
+                                    }
                                 }
                             });
                         if self.selected_port != old_port {
@@ -1508,6 +1653,7 @@ impl eframe::App for RedsailGuiApp {
                         }
 
                         if self.developer_mode {
+                            ui.add_space(4.0);
                             ui.horizontal(|ui| {
                                 ui.label("Baud:");
                                 if ui.radio_value(&mut self.baud, 9600, "9600").changed()

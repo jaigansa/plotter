@@ -1,6 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 30 30" width="30mm" height="30mm">
-  <!-- Outer calibration square (20mm x 20mm) -->
-  <rect x="5" y="5" width="20" height="20" fill="none" stroke="black" stroke-width="0.5"/>
-  <!-- Inner calibration circle (14mm diameter) -->
-  <circle cx="15" cy="15" r="7" fill="none" stroke="black" stroke-width="0.5"/>
-</svg>
