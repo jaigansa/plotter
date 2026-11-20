@@ -12,6 +12,21 @@ use crate::hpgl::{mm_to_plotter, CutterSettings, HpglBuilder};
 use crate::svg_parser::{parse_svg, SvgDocument, SvgGroupItem, SvgPathItem};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanvasOriginCorner {
+    BottomRight, // Machine / Plotter Physical Alignment (Default)
+    TopLeft,     // Standard Screen / Graphics Alignment
+}
+
+impl CanvasOriginCorner {
+    pub fn name(&self) -> &'static str {
+        match self {
+            CanvasOriginCorner::BottomRight => "Origin: Bottom-Right",
+            CanvasOriginCorner::TopLeft => "Origin: Top-Left",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaterialPreset {
     PenPlotter,    // Pen on Paper / Calibration (Zero Offset)
     StandardVinyl, // Oracal 651 / 631
@@ -100,6 +115,8 @@ pub struct TransformedOutput {
     pub weeding_box: Option<Vec<kurbo::Point>>,
     #[allow(dead_code)]
     pub bounds: (f64, f64, f64, f64),
+    #[allow(dead_code)]
+    pub active_bounds: (f64, f64, f64, f64),
 }
 
 pub enum SerialCommand {
@@ -404,6 +421,13 @@ pub struct RedsailGuiApp {
     resp_rx: Receiver<SerialResponse>,
     canvas_zoom: f32,
     canvas_pan: Vec2,
+    pub canvas_origin_corner: CanvasOriginCorner,
+    pub show_rulers: bool,
+    pub pos_x_mm: f64,
+    pub pos_y_mm: f64,
+    pub pos_active_only: bool,
+    pub target_move_x: f64,
+    pub target_move_y: f64,
 }
 
 fn find_preferred_port(ports: &[DetectedPort]) -> String {
@@ -478,6 +502,13 @@ impl Default for RedsailGuiApp {
             resp_rx,
             canvas_zoom: 1.0,
             canvas_pan: Vec2::ZERO,
+            canvas_origin_corner: CanvasOriginCorner::BottomRight,
+            show_rulers: true,
+            pos_x_mm: 0.0,
+            pos_y_mm: 0.0,
+            pos_active_only: true,
+            target_move_x: 0.0,
+            target_move_y: 0.0,
         };
 
         app.load_svg();
@@ -534,6 +565,7 @@ impl RedsailGuiApp {
         let tx = self.file_picker_tx.clone();
         std::thread::spawn(move || {
             let output = std::process::Command::new("zenity")
+                .env("GDK_BACKEND", "x11") // Bypass Wayland portal parent window association deadlock on Hyprland
                 .arg("--file-selection")
                 .arg("--multiple")
                 .arg("--separator=|")
@@ -681,23 +713,40 @@ impl RedsailGuiApp {
             return TransformedOutput::default();
         }
 
-        let mut min_x = f64::MAX;
-        let mut min_y = f64::MAX;
-        let mut max_x = f64::MIN;
-        let mut max_y = f64::MIN;
+        let mut doc_min_x = f64::MAX;
+        let mut doc_min_y = f64::MAX;
+        let mut doc_max_x = f64::MIN;
+        let mut doc_max_y = f64::MIN;
 
-        for (path, _) in &all_paths {
+        let mut act_raw_min_x = f64::MAX;
+        let mut act_raw_min_y = f64::MAX;
+        let mut act_raw_max_y = f64::MIN;
+        let mut has_active = false;
+
+        for (path, is_active) in &all_paths {
             for pt in path {
-                if pt.x < min_x { min_x = pt.x; }
-                if pt.x > max_x { max_x = pt.x; }
-                if pt.y < min_y { min_y = pt.y; }
-                if pt.y > max_y { max_y = pt.y; }
+                if pt.x < doc_min_x { doc_min_x = pt.x; }
+                if pt.x > doc_max_x { doc_max_x = pt.x; }
+                if pt.y < doc_min_y { doc_min_y = pt.y; }
+                if pt.y > doc_max_y { doc_max_y = pt.y; }
+
+                if *is_active {
+                    has_active = true;
+                    if pt.x < act_raw_min_x { act_raw_min_x = pt.x; }
+                    if pt.y < act_raw_min_y { act_raw_min_y = pt.y; }
+                    if pt.y > act_raw_max_y { act_raw_max_y = pt.y; }
+                }
             }
         }
 
-        if min_x > max_x || min_y > max_y {
-            min_x = 0.0; max_x = 0.0;
-            min_y = 0.0; max_y = 0.0;
+        if doc_min_x > doc_max_x || doc_min_y > doc_max_y {
+            doc_min_x = 0.0; doc_max_x = 0.0;
+            doc_min_y = 0.0; doc_max_y = 0.0;
+        }
+        if act_raw_min_y > act_raw_max_y {
+            act_raw_min_x = 0.0;
+            act_raw_min_y = 0.0;
+            act_raw_max_y = 0.0;
         }
 
         let (eff_scale_x, eff_scale_y) = if self.orig_width_mm > 0.0 && self.orig_height_mm > 0.0 {
@@ -725,22 +774,45 @@ impl RedsailGuiApp {
             let pts: Vec<kurbo::Point> = path
                 .iter()
                 .map(|pt| {
-                    let norm_x = if self.normalize_origin {
-                        pt.x - min_x
+                    let (norm_x, norm_y, offset_x, offset_y) = if self.pos_active_only && has_active {
+                        if is_active {
+                            // Active paths zero-normalize to active cut bounds and offset by user pos_x/pos_y
+                            let nx = if self.normalize_origin { pt.x - act_raw_min_x } else { pt.x };
+                            let ny = if self.flip_y {
+                                act_raw_max_y - pt.y
+                            } else if self.normalize_origin {
+                                pt.y - act_raw_min_y
+                            } else {
+                                pt.y
+                            };
+                            (nx, ny, self.pos_x_mm, self.pos_y_mm)
+                        } else {
+                            // Inactive paths remain at baseline document coordinates as reference
+                            let nx = if self.normalize_origin { pt.x - doc_min_x } else { pt.x };
+                            let ny = if self.flip_y {
+                                doc_max_y - pt.y
+                            } else if self.normalize_origin {
+                                pt.y - doc_min_y
+                            } else {
+                                pt.y
+                            };
+                            (nx, ny, 0.0, 0.0)
+                        }
                     } else {
-                        pt.x
+                        // All paths normalized together to document bounds and shifted together
+                        let nx = if self.normalize_origin { pt.x - doc_min_x } else { pt.x };
+                        let ny = if self.flip_y {
+                            doc_max_y - pt.y
+                        } else if self.normalize_origin {
+                            pt.y - doc_min_y
+                        } else {
+                            pt.y
+                        };
+                        (nx, ny, self.pos_x_mm, self.pos_y_mm)
                     };
 
-                    let norm_y = if self.flip_y {
-                        max_y - pt.y
-                    } else if self.normalize_origin {
-                        pt.y - min_y
-                    } else {
-                        pt.y
-                    };
-
-                    let mut x = norm_x * eff_scale_x + base_offset;
-                    let mut y = norm_y * eff_scale_y + base_offset;
+                    let mut x = norm_x * eff_scale_x + base_offset + offset_x;
+                    let mut y = norm_y * eff_scale_y + base_offset + offset_y;
 
                     if self.swap_xy {
                         std::mem::swap(&mut x, &mut y);
@@ -763,6 +835,12 @@ impl RedsailGuiApp {
             }
         }
 
+        let active_bounds = if act_min_x <= act_max_x && act_min_y <= act_max_y {
+            (act_min_x, act_min_y, act_max_x, act_max_y)
+        } else {
+            (0.0, 0.0, 0.0, 0.0)
+        };
+
         let weeding_box = if self.add_weeding_box && !active_paths.is_empty() && act_min_x <= act_max_x {
             let wm = self.weeding_margin;
             let bx0 = (act_min_x - wm).max(0.0);
@@ -784,7 +862,8 @@ impl RedsailGuiApp {
             active_paths,
             inactive_paths,
             weeding_box,
-            bounds: (min_x, min_y, max_x, max_y),
+            bounds: (doc_min_x, doc_min_y, doc_max_x, doc_max_y),
+            active_bounds,
         }
     }
 
@@ -1050,6 +1129,23 @@ impl RedsailGuiApp {
         self.est_pos_x = 0.0;
         self.est_pos_y = 0.0;
         self.send_raw_command("PA;PU0,0;", "Return to Origin (0,0)");
+    }
+
+    fn move_to_position(&mut self, x_mm: f64, y_mm: f64) {
+        if self.is_cutting {
+            self.log("[Blocked] Cannot move while a cut job is in progress.".to_string());
+            return;
+        }
+
+        let target_y_steps = (x_mm * 40.0).round() as i32;
+        let target_x_steps = (y_mm * 40.0).round() as i32;
+        self.cutter_y_steps = target_y_steps;
+        self.cutter_x_steps = target_x_steps;
+        let cmd = format!("PA;PU{},{};", self.cutter_x_steps, self.cutter_y_steps);
+        let desc = format!("Rapid move to X={:.1} mm, Y={:.1} mm", x_mm, y_mm);
+        self.send_raw_command(&cmd, &desc);
+        self.est_pos_x = (x_mm * 10.0).round() / 10.0;
+        self.est_pos_y = (y_mm * 10.0).round() / 10.0;
     }
 
     fn set_origin_here(&mut self) {
@@ -1373,10 +1469,10 @@ impl eframe::App for RedsailGuiApp {
 
                 ui.add_space(6.0);
 
-                // --- 2. Sizing & Dimensions ---
+                // --- 2. Sizing & Position ---
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(format!("{} Size & Dimensions", icons::RULER)).strong().size(12.0));
+                        ui.label(egui::RichText::new(format!("{} Size & Position", icons::RULER)).strong().size(12.0));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("200%").clicked() && self.orig_width_mm > 0.0 {
                                 self.scale = 2.0;
@@ -1425,6 +1521,53 @@ impl eframe::App for RedsailGuiApp {
                             let ratio = self.custom_height_mm / self.orig_height_mm;
                             self.custom_width_mm = (self.orig_width_mm * ratio * 10.0).round() / 10.0;
                             self.scale = ratio;
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Pos X:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.pos_x_mm)
+                                .speed(0.5)
+                                .range(0.0..=2000.0)
+                                .max_decimals(1)
+                                .suffix(" mm"),
+                        );
+
+                        ui.add_space(8.0);
+
+                        ui.label("Pos Y:");
+                        ui.add(
+                            egui::DragValue::new(&mut self.pos_y_mm)
+                                .speed(0.5)
+                                .range(0.0..=5000.0)
+                                .max_decimals(1)
+                                .suffix(" mm"),
+                        );
+
+                        if (self.pos_x_mm != 0.0 || self.pos_y_mm != 0.0)
+                            && ui.small_button("Reset (0,0)").on_hover_text("Reset position offsets to 0,0").clicked()
+                        {
+                            self.pos_x_mm = 0.0;
+                            self.pos_y_mm = 0.0;
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.pos_active_only, "Active Cut Only")
+                            .on_hover_text("When checked, position offsets and zero alignment apply strictly to the selected/active cut paths");
+                        if self.pos_active_only {
+                            ui.label(
+                                egui::RichText::new("(Positions active layer)")
+                                    .size(10.0)
+                                    .color(Color32::from_rgb(0, 210, 255)),
+                            );
+                        } else {
+                            ui.label(
+                                egui::RichText::new("(Positions all artwork)")
+                                    .size(10.0)
+                                    .color(Color32::from_rgb(140, 150, 170)),
+                            );
                         }
                     });
 
@@ -1709,6 +1852,17 @@ impl eframe::App for RedsailGuiApp {
                                 });
                             });
 
+                        ui.add_space(3.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Go X:");
+                            ui.add(egui::DragValue::new(&mut self.target_move_x).speed(1.0).max_decimals(1).suffix(" mm"));
+                            ui.label("Y:");
+                            ui.add(egui::DragValue::new(&mut self.target_move_y).speed(1.0).max_decimals(1).suffix(" mm"));
+                            if ui.button("Go").on_hover_text("Rapidly travel tool head to absolute coordinates (blade lifted)").clicked() {
+                                self.move_to_position(self.target_move_x, self.target_move_y);
+                            }
+                        });
+
                         ui.add_space(4.0);
 
                         ui.vertical_centered_justified(|ui| {
@@ -1850,6 +2004,37 @@ impl eframe::App for RedsailGuiApp {
                     );
                 }
 
+                ui.separator();
+                egui::ComboBox::from_id_salt("canvas_origin_selector")
+                    .selected_text(self.canvas_origin_corner.name())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.canvas_origin_corner,
+                            CanvasOriginCorner::BottomRight,
+                            "Bottom-Right (Machine Standard)",
+                        );
+                        ui.selectable_value(
+                            &mut self.canvas_origin_corner,
+                            CanvasOriginCorner::TopLeft,
+                            "Top-Left (Screen Standard)",
+                        );
+                    });
+
+                ui.separator();
+                let ruler_btn = if self.show_rulers {
+                    egui::Button::new(format!("{} Ruler", icons::RULER))
+                        .fill(Color32::from_rgb(0, 100, 140))
+                } else {
+                    egui::Button::new(format!("{} Ruler", icons::RULER))
+                };
+                if ui
+                    .add(ruler_btn)
+                    .on_hover_text("Toggle metric CAD edge rulers on/off")
+                    .clicked()
+                {
+                    self.show_rulers = !self.show_rulers;
+                }
+
                 // Canvas Zoom Controls on the Right
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button(format!("{} Fit View", icons::ARROWS_OUT)).on_hover_text("Reset Pan and Zoom to fit artwork").clicked() {
@@ -1892,35 +2077,47 @@ impl eframe::App for RedsailGuiApp {
             // Draw deep CAD canvas background
             painter.rect_filled(canvas_rect, 0.0, Color32::from_rgb(17, 18, 24));
 
-            let base_origin = canvas_rect.left_top() + Vec2::new(50.0, 50.0);
+            let base_origin = match self.canvas_origin_corner {
+                CanvasOriginCorner::BottomRight => canvas_rect.right_bottom() - Vec2::new(50.0, 50.0),
+                CanvasOriginCorner::TopLeft => canvas_rect.left_top() + Vec2::new(50.0, 50.0),
+            };
             let origin = base_origin + self.canvas_pan;
 
             // Transform paths
             let output = self.transform_paths();
             let has_paths = !output.active_paths.is_empty() || !output.inactive_paths.is_empty();
 
-            let max_dim = (self.custom_width_mm.max(self.custom_height_mm)
-                + (self.weeding_margin * 2.0))
-                .max(10.0) as f32;
+            let max_w = (self.custom_width_mm + self.pos_x_mm + (self.weeding_margin * 2.0)).max(10.0);
+            let max_h = (self.custom_height_mm + self.pos_y_mm + (self.weeding_margin * 2.0)).max(10.0);
+            let max_dim = (max_w.max(max_h)) as f32;
             let avail_w = (canvas_rect.width() - 120.0).max(50.0);
             let avail_h = (canvas_rect.height() - 120.0).max(50.0);
             let auto_fit_zoom = (avail_w / max_dim).min(avail_h / max_dim).clamp(0.2, 10.0);
             let effective_zoom = auto_fit_zoom * self.canvas_zoom;
 
+            let origin_corner = self.canvas_origin_corner;
+            let swap_xy = self.swap_xy;
             let to_screen = |pt: kurbo::Point| -> Pos2 {
-                let (sx, sy) = if self.swap_xy {
+                let (sx, sy) = if swap_xy {
                     (pt.y as f32, pt.x as f32)
                 } else {
                     (pt.x as f32, pt.y as f32)
                 };
-                Pos2::new(origin.x + (sx * effective_zoom), origin.y + (sy * effective_zoom))
+                match origin_corner {
+                    CanvasOriginCorner::BottomRight => {
+                        Pos2::new(origin.x - (sx * effective_zoom), origin.y - (sy * effective_zoom))
+                    }
+                    CanvasOriginCorner::TopLeft => {
+                        Pos2::new(origin.x + (sx * effective_zoom), origin.y + (sy * effective_zoom))
+                    }
+                }
             };
 
             // Draw Metric CAD Grid (10mm minor, 50mm major)
             if effective_zoom > 0.3 {
                 let minor_step = if effective_zoom > 1.8 { 10.0 } else { 50.0 };
-                let grid_w = (self.custom_width_mm.max(100.0) * 1.3) as f32;
-                let grid_h = (self.custom_height_mm.max(100.0) * 1.3) as f32;
+                let grid_w = ((self.custom_width_mm + self.pos_x_mm).max(100.0) * 1.3) as f32;
+                let grid_h = ((self.custom_height_mm + self.pos_y_mm).max(100.0) * 1.3) as f32;
 
                 let minor_stroke = Stroke::new(0.5_f32, Color32::from_rgb(26, 28, 38));
                 let major_stroke = Stroke::new(0.8_f32, Color32::from_rgb(38, 42, 58));
@@ -1951,39 +2148,81 @@ impl eframe::App for RedsailGuiApp {
             // Origin marker (0, 0)
             painter.circle_filled(origin, 5.0, Color32::from_rgb(239, 68, 68));
             painter.circle_stroke(origin, 8.0, Stroke::new(1.0_f32, Color32::from_rgb(239, 68, 68)));
-            painter.text(
-                origin + Vec2::new(10.0, -10.0),
-                egui::Align2::LEFT_BOTTOM,
-                "Origin (0,0)",
-                egui::FontId::monospace(11.0),
-                Color32::from_rgb(240, 240, 240),
-            );
 
             // Draw axis guides
             let axis_len = 65.0 * effective_zoom.clamp(0.6, 1.2);
-            painter.line_segment(
-                [origin, origin + Vec2::new(axis_len, 0.0)],
-                Stroke::new(1.5_f32, Color32::from_rgb(239, 68, 68)),
-            );
-            painter.text(
-                origin + Vec2::new(axis_len + 4.0, 0.0),
-                egui::Align2::LEFT_CENTER,
-                "+Width (Carriage)",
-                egui::FontId::monospace(10.0),
-                Color32::from_rgb(255, 120, 120),
-            );
+            match self.canvas_origin_corner {
+                CanvasOriginCorner::BottomRight => {
+                    painter.text(
+                        origin + Vec2::new(10.0, 10.0),
+                        egui::Align2::LEFT_TOP,
+                        "Origin (0,0)",
+                        egui::FontId::monospace(11.0),
+                        Color32::from_rgb(240, 240, 240),
+                    );
 
-            painter.line_segment(
-                [origin, origin + Vec2::new(0.0, axis_len)],
-                Stroke::new(1.5_f32, Color32::from_rgb(34, 197, 94)),
-            );
-            painter.text(
-                origin + Vec2::new(0.0, axis_len + 4.0),
-                egui::Align2::CENTER_TOP,
-                "+Length (Feed)",
-                egui::FontId::monospace(10.0),
-                Color32::from_rgb(100, 255, 140),
-            );
+                    // +Width (Carriage) extends Leftward
+                    painter.line_segment(
+                        [origin, origin + Vec2::new(-axis_len, 0.0)],
+                        Stroke::new(1.5_f32, Color32::from_rgb(239, 68, 68)),
+                    );
+                    painter.text(
+                        origin + Vec2::new(-axis_len - 4.0, 0.0),
+                        egui::Align2::RIGHT_CENTER,
+                        "+Width (Carriage)",
+                        egui::FontId::monospace(10.0),
+                        Color32::from_rgb(255, 120, 120),
+                    );
+
+                    // +Length (Feed) extends Upward
+                    painter.line_segment(
+                        [origin, origin + Vec2::new(0.0, -axis_len)],
+                        Stroke::new(1.5_f32, Color32::from_rgb(34, 197, 94)),
+                    );
+                    painter.text(
+                        origin + Vec2::new(0.0, -axis_len - 4.0),
+                        egui::Align2::CENTER_BOTTOM,
+                        "+Length (Feed)",
+                        egui::FontId::monospace(10.0),
+                        Color32::from_rgb(100, 255, 140),
+                    );
+                }
+                CanvasOriginCorner::TopLeft => {
+                    painter.text(
+                        origin + Vec2::new(10.0, -10.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        "Origin (0,0)",
+                        egui::FontId::monospace(11.0),
+                        Color32::from_rgb(240, 240, 240),
+                    );
+
+                    // +Width (Carriage) extends Rightward
+                    painter.line_segment(
+                        [origin, origin + Vec2::new(axis_len, 0.0)],
+                        Stroke::new(1.5_f32, Color32::from_rgb(239, 68, 68)),
+                    );
+                    painter.text(
+                        origin + Vec2::new(axis_len + 4.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        "+Width (Carriage)",
+                        egui::FontId::monospace(10.0),
+                        Color32::from_rgb(255, 120, 120),
+                    );
+
+                    // +Length (Feed) extends Downward
+                    painter.line_segment(
+                        [origin, origin + Vec2::new(0.0, axis_len)],
+                        Stroke::new(1.5_f32, Color32::from_rgb(34, 197, 94)),
+                    );
+                    painter.text(
+                        origin + Vec2::new(0.0, axis_len + 4.0),
+                        egui::Align2::CENTER_TOP,
+                        "+Length (Feed)",
+                        egui::FontId::monospace(10.0),
+                        Color32::from_rgb(100, 255, 140),
+                    );
+                }
+            }
 
             if has_paths {
                 // 1. Draw inactive / unselected paths in dimmed dark slate
@@ -2027,20 +2266,30 @@ impl eframe::App for RedsailGuiApp {
                         painter.line_segment([p0, p1], box_stroke);
                     }
                     let p_wbox_label = to_screen(wbox[0]);
+                    let (wbox_offset, wbox_align) = match self.canvas_origin_corner {
+                        CanvasOriginCorner::BottomRight => (Vec2::new(-4.0, -4.0), egui::Align2::RIGHT_BOTTOM),
+                        CanvasOriginCorner::TopLeft => (Vec2::new(4.0, 4.0), egui::Align2::LEFT_TOP),
+                    };
                     painter.text(
-                        p_wbox_label + Vec2::new(4.0, 4.0),
-                        egui::Align2::LEFT_TOP,
+                        p_wbox_label + wbox_offset,
+                        wbox_align,
                         "Weeding Border",
                         egui::FontId::monospace(10.0),
                         Color32::from_rgb(245, 158, 11),
                     );
                 }
 
-                // 4. Floating Legend Card in Bottom-Right
-                let legend_rect = egui::Rect::from_min_size(
-                    canvas_rect.right_bottom() - Vec2::new(190.0, 70.0),
-                    Vec2::new(180.0, 62.0),
-                );
+                // 4. Floating Legend Card
+                let legend_rect = match self.canvas_origin_corner {
+                    CanvasOriginCorner::BottomRight => egui::Rect::from_min_size(
+                        canvas_rect.left_bottom() + Vec2::new(16.0, -98.0),
+                        Vec2::new(180.0, 62.0),
+                    ),
+                    CanvasOriginCorner::TopLeft => egui::Rect::from_min_size(
+                        canvas_rect.right_bottom() - Vec2::new(190.0, 70.0),
+                        Vec2::new(180.0, 62.0),
+                    ),
+                };
                 painter.rect(
                     legend_rect,
                     egui::CornerRadius::same(6),
@@ -2068,6 +2317,335 @@ impl eframe::App for RedsailGuiApp {
                     egui::FontId::proportional(16.0),
                     Color32::from_rgb(80, 85, 105),
                 );
+            }
+
+            // Metric CAD Edge Rulers (Origin-Synchronized)
+            if self.show_rulers {
+                let ruler_th_h = 20.0_f32;
+                let ruler_th_w = 26.0_f32;
+
+                // Match ruler edges directly with the active origin corner
+                let (h_ruler_rect, v_ruler_rect, corner_rect) = match origin_corner {
+                    CanvasOriginCorner::BottomRight => {
+                        let h = egui::Rect::from_min_max(
+                            Pos2::new(canvas_rect.min.x, canvas_rect.max.y - ruler_th_h),
+                            Pos2::new(canvas_rect.max.x - ruler_th_w, canvas_rect.max.y),
+                        );
+                        let v = egui::Rect::from_min_max(
+                            Pos2::new(canvas_rect.max.x - ruler_th_w, canvas_rect.min.y),
+                            Pos2::new(canvas_rect.max.x, canvas_rect.max.y - ruler_th_h),
+                        );
+                        let c = egui::Rect::from_min_max(
+                            Pos2::new(canvas_rect.max.x - ruler_th_w, canvas_rect.max.y - ruler_th_h),
+                            canvas_rect.max,
+                        );
+                        (h, v, c)
+                    }
+                    CanvasOriginCorner::TopLeft => {
+                        let h = egui::Rect::from_min_max(
+                            Pos2::new(canvas_rect.min.x + ruler_th_w, canvas_rect.min.y),
+                            Pos2::new(canvas_rect.max.x, canvas_rect.min.y + ruler_th_h),
+                        );
+                        let v = egui::Rect::from_min_max(
+                            Pos2::new(canvas_rect.min.x, canvas_rect.min.y + ruler_th_h),
+                            Pos2::new(canvas_rect.min.x + ruler_th_w, canvas_rect.max.y),
+                        );
+                        let c = egui::Rect::from_min_max(
+                            canvas_rect.min,
+                            Pos2::new(canvas_rect.min.x + ruler_th_w, canvas_rect.min.y + ruler_th_h),
+                        );
+                        (h, v, c)
+                    }
+                };
+
+                // Ruler background strips
+                let ruler_bg = Color32::from_rgb(22, 24, 32);
+                let ruler_border = Stroke::new(1.0_f32, Color32::from_rgb(45, 50, 68));
+                painter.rect_filled(h_ruler_rect, 0.0, ruler_bg);
+                match origin_corner {
+                    CanvasOriginCorner::BottomRight => {
+                        painter.line_segment([h_ruler_rect.left_top(), h_ruler_rect.right_top()], ruler_border);
+                    }
+                    CanvasOriginCorner::TopLeft => {
+                        painter.line_segment([h_ruler_rect.left_bottom(), h_ruler_rect.right_bottom()], ruler_border);
+                    }
+                }
+
+                painter.rect_filled(v_ruler_rect, 0.0, ruler_bg);
+                match origin_corner {
+                    CanvasOriginCorner::BottomRight => {
+                        painter.line_segment([v_ruler_rect.left_top(), v_ruler_rect.left_bottom()], ruler_border);
+                    }
+                    CanvasOriginCorner::TopLeft => {
+                        painter.line_segment([v_ruler_rect.right_top(), v_ruler_rect.right_bottom()], ruler_border);
+                    }
+                }
+
+                // Corner junction badge
+                painter.rect_filled(corner_rect, 0.0, Color32::from_rgb(28, 31, 42));
+                match origin_corner {
+                    CanvasOriginCorner::BottomRight => {
+                        painter.line_segment([corner_rect.left_top(), corner_rect.right_top()], ruler_border);
+                        painter.line_segment([corner_rect.left_top(), corner_rect.left_bottom()], ruler_border);
+                    }
+                    CanvasOriginCorner::TopLeft => {
+                        painter.line_segment([corner_rect.left_bottom(), corner_rect.right_bottom()], ruler_border);
+                        painter.line_segment([corner_rect.right_top(), corner_rect.right_bottom()], ruler_border);
+                    }
+                }
+                painter.text(
+                    corner_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "mm",
+                    egui::FontId::monospace(10.0),
+                    Color32::from_rgb(0, 200, 255),
+                );
+
+                // Zero-alignment dashed guides linking ruler 0 ticks directly to Plotter Origin (0,0) marker
+                let zero_guide_stroke = Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(239, 68, 68, 140));
+                if canvas_rect.x_range().contains(origin.x) {
+                    let (y0, y1) = match origin_corner {
+                        CanvasOriginCorner::BottomRight => (origin.y, h_ruler_rect.min.y),
+                        CanvasOriginCorner::TopLeft => (h_ruler_rect.max.y, origin.y),
+                    };
+                    if (y1 - y0).abs() > 3.0 {
+                        painter.line_segment([Pos2::new(origin.x, y0), Pos2::new(origin.x, y1)], zero_guide_stroke);
+                    }
+                }
+                if canvas_rect.y_range().contains(origin.y) {
+                    let (x0, x1) = match origin_corner {
+                        CanvasOriginCorner::BottomRight => (origin.x, v_ruler_rect.min.x),
+                        CanvasOriginCorner::TopLeft => (v_ruler_rect.max.x, origin.x),
+                    };
+                    if (x1 - x0).abs() > 3.0 {
+                        painter.line_segment([Pos2::new(x0, origin.y), Pos2::new(x1, origin.y)], zero_guide_stroke);
+                    }
+                }
+
+                // Adaptive step sizing based on zoom
+                let (step_major, step_mid, step_minor) = if effective_zoom > 4.0 {
+                    (10.0_f64, 5.0_f64, 1.0_f64)
+                } else if effective_zoom > 1.8 {
+                    (20.0_f64, 10.0_f64, 2.0_f64)
+                } else if effective_zoom > 0.8 {
+                    (50.0_f64, 25.0_f64, 5.0_f64)
+                } else if effective_zoom > 0.35 {
+                    (100.0_f64, 50.0_f64, 10.0_f64)
+                } else {
+                    (200.0_f64, 100.0_f64, 20.0_f64)
+                };
+
+                // 1. Horizontal Ruler Graduations (Width / Carriage)
+                if effective_zoom > 0.001 && h_ruler_rect.width() > 10.0 {
+                    let h_raw_a = match origin_corner {
+                        CanvasOriginCorner::BottomRight => ((origin.x - h_ruler_rect.max.x) / effective_zoom) as f64,
+                        CanvasOriginCorner::TopLeft => ((h_ruler_rect.min.x - origin.x) / effective_zoom) as f64,
+                    };
+                    let h_raw_b = match origin_corner {
+                        CanvasOriginCorner::BottomRight => ((origin.x - h_ruler_rect.min.x) / effective_zoom) as f64,
+                        CanvasOriginCorner::TopLeft => ((h_ruler_rect.max.x - origin.x) / effective_zoom) as f64,
+                    };
+                    if h_raw_a.is_finite() && h_raw_b.is_finite() {
+                        let (h_min_mm, h_max_mm) = if h_raw_a < h_raw_b { (h_raw_a, h_raw_b) } else { (h_raw_b, h_raw_a) };
+                        let span = (h_max_mm - h_min_mm).max(1.0);
+                        let eff_step = if span / step_minor > 150.0 { step_major } else { step_minor };
+                        let h_start_idx = (h_min_mm / eff_step).floor() as i32;
+                        let h_end_idx = (h_max_mm / eff_step).ceil() as i32;
+                        let clamped_end = h_end_idx.min(h_start_idx.saturating_add(200));
+
+                        for idx in h_start_idx..=clamped_end {
+                            let val_mm = (idx as f64) * eff_step;
+                            let screen_x = match origin_corner {
+                                CanvasOriginCorner::BottomRight => origin.x - (val_mm as f32 * effective_zoom),
+                                CanvasOriginCorner::TopLeft => origin.x + (val_mm as f32 * effective_zoom),
+                            };
+
+                            if screen_x >= h_ruler_rect.min.x && screen_x <= h_ruler_rect.max.x {
+                                let is_major = (val_mm.round() as i64).rem_euclid(step_major as i64) == 0;
+                                let is_mid = !is_major && (val_mm.round() as i64).rem_euclid(step_mid as i64) == 0;
+
+                                let (tick_len, stroke) = if is_major {
+                                    (10.0_f32, Stroke::new(1.0_f32, Color32::from_rgb(170, 185, 210)))
+                                } else if is_mid {
+                                    (6.0_f32, Stroke::new(0.8_f32, Color32::from_rgb(110, 120, 145)))
+                                } else {
+                                    (3.5_f32, Stroke::new(0.6_f32, Color32::from_rgb(70, 78, 98)))
+                                };
+
+                                let (p_base, p_tip) = match origin_corner {
+                                    CanvasOriginCorner::BottomRight => (
+                                        Pos2::new(screen_x, h_ruler_rect.min.y),
+                                        Pos2::new(screen_x, h_ruler_rect.min.y + tick_len),
+                                    ),
+                                    CanvasOriginCorner::TopLeft => (
+                                        Pos2::new(screen_x, h_ruler_rect.max.y),
+                                        Pos2::new(screen_x, h_ruler_rect.max.y - tick_len),
+                                    ),
+                                };
+                                painter.line_segment([p_base, p_tip], stroke);
+
+                                if is_major {
+                                    let label = format!("{:.0}", val_mm);
+                                    let (label_pos, align) = match origin_corner {
+                                        CanvasOriginCorner::BottomRight => (
+                                            Pos2::new(screen_x - 2.0, h_ruler_rect.max.y - 2.0),
+                                            egui::Align2::RIGHT_BOTTOM,
+                                        ),
+                                        CanvasOriginCorner::TopLeft => (
+                                            Pos2::new(screen_x + 2.0, h_ruler_rect.min.y + 2.0),
+                                            egui::Align2::LEFT_TOP,
+                                        ),
+                                    };
+                                    painter.text(
+                                        label_pos,
+                                        align,
+                                        label,
+                                        egui::FontId::monospace(9.0),
+                                        if val_mm.abs() < 0.001 {
+                                            Color32::from_rgb(239, 68, 68)
+                                        } else {
+                                            Color32::from_rgb(170, 185, 210)
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 2. Vertical Ruler Graduations (Length / Feed)
+                if effective_zoom > 0.001 && v_ruler_rect.height() > 10.0 {
+                    let v_raw_a = match origin_corner {
+                        CanvasOriginCorner::BottomRight => ((origin.y - v_ruler_rect.max.y) / effective_zoom) as f64,
+                        CanvasOriginCorner::TopLeft => ((v_ruler_rect.min.y - origin.y) / effective_zoom) as f64,
+                    };
+                    let v_raw_b = match origin_corner {
+                        CanvasOriginCorner::BottomRight => ((origin.y - v_ruler_rect.min.y) / effective_zoom) as f64,
+                        CanvasOriginCorner::TopLeft => ((v_ruler_rect.max.y - origin.y) / effective_zoom) as f64,
+                    };
+                    if v_raw_a.is_finite() && v_raw_b.is_finite() {
+                        let (v_min_mm, v_max_mm) = if v_raw_a < v_raw_b { (v_raw_a, v_raw_b) } else { (v_raw_b, v_raw_a) };
+                        let span = (v_max_mm - v_min_mm).max(1.0);
+                        let eff_step = if span / step_minor > 150.0 { step_major } else { step_minor };
+                        let v_start_idx = (v_min_mm / eff_step).floor() as i32;
+                        let v_end_idx = (v_max_mm / eff_step).ceil() as i32;
+                        let clamped_end = v_end_idx.min(v_start_idx.saturating_add(200));
+
+                        for idx in v_start_idx..=clamped_end {
+                            let val_mm = (idx as f64) * eff_step;
+                            let screen_y = match origin_corner {
+                                CanvasOriginCorner::BottomRight => origin.y - (val_mm as f32 * effective_zoom),
+                                CanvasOriginCorner::TopLeft => origin.y + (val_mm as f32 * effective_zoom),
+                            };
+
+                            if screen_y >= v_ruler_rect.min.y && screen_y <= v_ruler_rect.max.y {
+                                let is_major = (val_mm.round() as i64).rem_euclid(step_major as i64) == 0;
+                                let is_mid = !is_major && (val_mm.round() as i64).rem_euclid(step_mid as i64) == 0;
+
+                                let (tick_len, stroke) = if is_major {
+                                    (10.0_f32, Stroke::new(1.0_f32, Color32::from_rgb(170, 185, 210)))
+                                } else if is_mid {
+                                    (6.0_f32, Stroke::new(0.8_f32, Color32::from_rgb(110, 120, 145)))
+                                } else {
+                                    (3.5_f32, Stroke::new(0.6_f32, Color32::from_rgb(70, 78, 98)))
+                                };
+
+                                let (p_base, p_tip) = match origin_corner {
+                                    CanvasOriginCorner::BottomRight => (
+                                        Pos2::new(v_ruler_rect.min.x, screen_y),
+                                        Pos2::new(v_ruler_rect.min.x + tick_len, screen_y),
+                                    ),
+                                    CanvasOriginCorner::TopLeft => (
+                                        Pos2::new(v_ruler_rect.max.x, screen_y),
+                                        Pos2::new(v_ruler_rect.max.x - tick_len, screen_y),
+                                    ),
+                                };
+                                painter.line_segment([p_base, p_tip], stroke);
+
+                                if is_major {
+                                    let label = format!("{:.0}", val_mm);
+                                    let (label_pos, align) = match origin_corner {
+                                        CanvasOriginCorner::BottomRight => (
+                                            Pos2::new(v_ruler_rect.max.x - 2.0, screen_y - 2.0),
+                                            egui::Align2::RIGHT_BOTTOM,
+                                        ),
+                                        CanvasOriginCorner::TopLeft => (
+                                            Pos2::new(v_ruler_rect.min.x + 2.0, screen_y - 2.0),
+                                            egui::Align2::LEFT_BOTTOM,
+                                        ),
+                                    };
+                                    painter.text(
+                                        label_pos,
+                                        align,
+                                        label,
+                                        egui::FontId::monospace(8.0),
+                                        if val_mm.abs() < 0.001 {
+                                            Color32::from_rgb(239, 68, 68)
+                                        } else {
+                                            Color32::from_rgb(170, 185, 210)
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 3. Mouse Cursor Tracking on Rulers
+                if let Some(hover_pos) = ctx.input(|i| i.pointer.hover_pos()) {
+                    if canvas_rect.contains(hover_pos) {
+                        let cursor_x_mm = match origin_corner {
+                            CanvasOriginCorner::BottomRight => (origin.x - hover_pos.x) / effective_zoom,
+                            CanvasOriginCorner::TopLeft => (hover_pos.x - origin.x) / effective_zoom,
+                        };
+                        let cursor_y_mm = match origin_corner {
+                            CanvasOriginCorner::BottomRight => (origin.y - hover_pos.y) / effective_zoom,
+                            CanvasOriginCorner::TopLeft => (hover_pos.y - origin.y) / effective_zoom,
+                        };
+
+                        // Hairline on horizontal ruler
+                        if hover_pos.x >= h_ruler_rect.min.x && hover_pos.x <= h_ruler_rect.max.x {
+                            painter.line_segment(
+                                [Pos2::new(hover_pos.x, h_ruler_rect.min.y), Pos2::new(hover_pos.x, h_ruler_rect.max.y)],
+                                Stroke::new(1.5_f32, Color32::from_rgb(0, 210, 255)),
+                            );
+                        }
+
+                        // Hairline on vertical ruler
+                        if hover_pos.y >= v_ruler_rect.min.y && hover_pos.y <= v_ruler_rect.max.y {
+                            painter.line_segment(
+                                [Pos2::new(v_ruler_rect.min.x, hover_pos.y), Pos2::new(v_ruler_rect.max.x, hover_pos.y)],
+                                Stroke::new(1.5_f32, Color32::from_rgb(34, 197, 94)),
+                            );
+                        }
+
+                        // Floating cursor coordinate pill (placed in opposite corner from rulers)
+                        let pill_rect = match origin_corner {
+                            CanvasOriginCorner::BottomRight => egui::Rect::from_min_size(
+                                Pos2::new(canvas_rect.min.x + 12.0, canvas_rect.min.y + 12.0),
+                                Vec2::new(145.0, 20.0),
+                            ),
+                            CanvasOriginCorner::TopLeft => egui::Rect::from_min_size(
+                                Pos2::new(canvas_rect.max.x - 157.0, canvas_rect.max.y - 32.0),
+                                Vec2::new(145.0, 20.0),
+                            ),
+                        };
+                        painter.rect(
+                            pill_rect,
+                            egui::CornerRadius::same(4),
+                            Color32::from_rgba_unmultiplied(16, 20, 30, 210),
+                            Stroke::new(1.0_f32, Color32::from_rgb(45, 52, 70)),
+                            egui::StrokeKind::Outside,
+                        );
+                        painter.text(
+                            pill_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            format!("X: {:.1} mm  Y: {:.1} mm", cursor_x_mm, cursor_y_mm),
+                            egui::FontId::monospace(10.0),
+                            Color32::from_rgb(200, 225, 255),
+                        );
+                    }
+                }
             }
         });
     }
